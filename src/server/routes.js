@@ -779,19 +779,16 @@ router.post('/v1/chat/completions', authenticateApiKey, async (req, res) => {
     const requestBody = generateRequestBody(messages, model, params, tools);
 
     if (stream) {
+      res.setHeader('Content-Type', 'text/event-stream');
+      res.setHeader('Cache-Control', 'no-cache');
+      res.setHeader('Connection', 'keep-alive');
+
       const id = `chatcmpl-${Date.now()}`;
       const created = Math.floor(Date.now() / 1000);
       let hasToolCall = false;
       let collectedImages = [];
-      let streamStarted = false;
 
       await multiAccountClient.generateResponse(requestBody, (data) => {
-        if (!streamStarted) {
-          res.setHeader('Content-Type', 'text/event-stream');
-          res.setHeader('Cache-Control', 'no-cache');
-          res.setHeader('Connection', 'keep-alive');
-          streamStarted = true;
-        }
         if (data.type === 'tool_calls') {
           hasToolCall = true;
           res.write(`data: ${JSON.stringify({
