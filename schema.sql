@@ -2,8 +2,6 @@
 -- PostgreSQL database dump
 --
 
-\restrict 8ngTyFHNToAOk58bu5kCPxvQDcp5aNvD0dO0QNattEdvi52RpAayASqBc2XT4ie
-
 -- Dumped from database version 18.1
 -- Dumped by pg_dump version 18.1
 
@@ -776,6 +774,4 @@ ALTER TABLE ONLY public.user_shared_quota_pool
 --
 -- PostgreSQL database dump complete
 --
-
-\unrestrict 8ngTyFHNToAOk58bu5kCPxvQDcp5aNvD0dO0QNattEdvi52RpAayASqBc2XT4ie
 
