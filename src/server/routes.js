@@ -412,6 +412,7 @@ router.get('/api/accounts', authenticateApiKey, async (req, res) => {
       expires_at: acc.expires_at,
       project_id_0: acc.project_id_0,
       is_restricted: acc.is_restricted,
+      paid_tier: acc.paid_tier,
       ineligible: acc.ineligible,
       last_used_at: acc.last_used_at,
       created_at: acc.created_at,
@@ -457,6 +458,7 @@ router.get('/api/accounts/:cookie_id', authenticateApiKey, async (req, res) => {
       expires_at: account.expires_at,
       project_id_0: account.project_id_0,
       is_restricted: account.is_restricted,
+      paid_tier: account.paid_tier,
       ineligible: account.ineligible,
       created_at: account.created_at,
       updated_at: account.updated_at
