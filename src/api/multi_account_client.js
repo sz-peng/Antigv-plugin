@@ -3,6 +3,7 @@ import logger from '../utils/logger.js';
 import accountService from '../services/account.service.js';
 import quotaService from '../services/quota.service.js';
 import oauthService from '../services/oauth.service.js';
+import signatureService from '../services/signature.service.js';
 
 /**
  * 自定义API错误类，包含HTTP状态码
@@ -176,11 +177,18 @@ class MultiAccountClient {
    * @param {Function} callback - 回调函数
    * @param {string} user_id - 用户ID
    * @param {string} model_name - 模型名称
+   * @param {Object} user - 用户对象
+   * @param {Array} originalMessages - 原始 OpenAI 格式的消息数组（用于 signature 管理）
+   * @param {Object} account - 账号对象（可选，如果不提供则自动获取）
    */
-  async generateResponse(requestBody, callback, user_id, model_name, user) {
-    const account = await this.getAvailableAccount(user_id, model_name, user);
+  async generateResponse(requestBody, callback, user_id, model_name, user, originalMessages = [], account = null, excludeProjectIds = []) {
+    // 如果没有提供 account，则获取一个
+    if (!account) {
+      account = await this.getAvailableAccount(user_id, model_name, user);
+    }
     
-    // 判断是否为 Gemini 模型（不输出 <think> 标记）
+    // 判断是否为 Gemini 模型
+    // Gemini 的思考内容需要转换为 OpenAI 兼容的 reasoning_content 格式
     const isGeminiModel = model_name.startsWith('gemini-');
     
     // 使用缓存的配额信息，不阻塞请求
@@ -207,6 +215,11 @@ class MultiAccountClient {
       logger.warn('获取缓存配额失败:', error.message);
     }
     
+    // 使用账号的 project_id_0
+    if (account.project_id_0) {
+      requestBody.project = account.project_id_0;
+    }
+    
     const url = config.api.url;
     
     const requestHeaders = {
@@ -220,11 +233,22 @@ class MultiAccountClient {
     let response;
     
     try {
-      response = await fetch(url, {
-        method: 'POST',
-        headers: requestHeaders,
-        body: JSON.stringify(requestBody)
-      });
+      // 创建 AbortController 用于超时控制
+      const controller = new AbortController();
+      const timeout = setTimeout(() => {
+        controller.abort();
+      }, 600000); // 10分钟超时
+      
+      try {
+        response = await fetch(url, {
+          method: 'POST',
+          headers: requestHeaders,
+          body: JSON.stringify(requestBody),
+          signal: controller.signal
+        });
+      } finally {
+        clearTimeout(timeout);
+      }
       
       if (!response.ok) {
         const responseText = await response.text();
@@ -233,19 +257,30 @@ class MultiAccountClient {
           logger.warn(`账号没有使用权限，已禁用: cookie_id=${account.cookie_id}`);
           await accountService.updateAccountStatus(account.cookie_id, 0);
         }
-        throw new ApiError(responseText, response.status, responseText);
+        
+        // 检查是否是配额耗尽错误
+        if (response.status === 429 || responseText.includes('quota') || responseText.includes('RESOURCE_EXHAUSTED')) {
+          logger.error(`[429错误] project_id_0 配额耗尽`);
+          callback({ type: 'error', content: 'RESOURCE_EXHAUSTED' });
+          return;
+        } else {
+          throw new ApiError(responseText, response.status, responseText);
+        }
       }
       
     } catch (error) {
+      // 如果还没有开始读取响应流，直接抛出错误
       throw error;
     }
 
+    // 从这里开始是流式传输，错误需要通过callback返回
     const reader = response.body.getReader();
     const decoder = new TextDecoder();
-    let thinkingStarted = false;
+    let reasoningContent = ''; // 累积 reasoning_content
     let toolCalls = [];
     let generatedImages = [];
     let buffer = ''; // 用于处理跨chunk的JSON
+    let collectedSignatures = []; // 收集响应中的 thought signatures
 
     let chunkCount = 0;
     while (true) {
@@ -275,27 +310,22 @@ class MultiAccountClient {
           const parts = data.response?.candidates?.[0]?.content?.parts;
           
           if (parts) {
+            // 提取 thought signatures
+            const signatures = signatureService.extractSignaturesFromResponse(parts);
+            if (signatures.length > 0) {
+              collectedSignatures.push(...signatures);
+            }
+            
             for (const part of parts) {
               if (part.thought === true) {
-                if (isGeminiModel) {
-                  // Gemini 模型：将 thought 内容当作普通文本返回
-                  callback({ type: 'text', content: part.text || '' });
-                } else {
-                  // 其他模型：使用 <think> 标记包裹
-                  if (!thinkingStarted) {
-                    callback({ type: 'thinking', content: '<think>\n' });
-                    thinkingStarted = true;
-                  }
-                  callback({ type: 'thinking', content: part.text || '' });
-                }
+                // Gemini 的思考内容转换为 OpenAI 兼容的 reasoning_content 格式
+                // 累积思考内容，稍后一起发送
+                reasoningContent += part.text || '';
+                callback({ type: 'reasoning', content: part.text || '' });
               } else if (part.text !== undefined) {
                 // 过滤掉空的非thought文本
                 if (part.text.trim() === '') {
                   continue;
-                }
-                if (thinkingStarted && !isGeminiModel) {
-                  callback({ type: 'thinking', content: '\n</think>\n' });
-                  thinkingStarted = false;
                 }
                 callback({ type: 'text', content: part.text });
               } else if (part.inlineData) {
@@ -325,10 +355,6 @@ class MultiAccountClient {
           }
           
           if (data.response?.candidates?.[0]?.finishReason) {
-            if (thinkingStarted && !isGeminiModel) {
-              callback({ type: 'thinking', content: '\n</think>\n' });
-              thinkingStarted = false;
-            }
             if (toolCalls.length > 0) {
               callback({ type: 'tool_calls', tool_calls: toolCalls });
               toolCalls = [];
@@ -337,6 +363,15 @@ class MultiAccountClient {
         } catch (e) {
           logger.warn(`JSON解析失败: ${e.message}`);
         }
+      }
+    }
+
+    // 存储收集到的 thought signatures
+    if (collectedSignatures.length > 0 && originalMessages.length > 0) {
+      try {
+        await signatureService.storeSignatures(user_id, originalMessages, collectedSignatures);
+      } catch (error) {
+        logger.error('存储 thought signatures 失败:', error.message);
       }
     }
 
@@ -453,7 +488,7 @@ class MultiAccountClient {
   }
 
   /**
-   * 刷新cookie的quota（实时获取）
+   * 刷新cookie的quota（实时获取，使用两个projectId并叠加配额）
    * @param {string} cookie_id - Cookie ID
    * @param {string} access_token - Access Token
    * @returns {Promise<void>}
@@ -462,6 +497,13 @@ class MultiAccountClient {
     const modelsUrl = config.api.modelsUrl;
     
     try {
+      // 获取账号信息以获取projectId
+      const account = await accountService.getAccountByCookieId(cookie_id);
+      if (!account) {
+        logger.warn(`账号不存在: cookie_id=${cookie_id}`);
+        return;
+      }
+      
       const requestHeaders = {
         'Host': config.api.host,
         'User-Agent': config.api.userAgent,
@@ -469,20 +511,31 @@ class MultiAccountClient {
         'Content-Type': 'application/json',
         'Accept-Encoding': 'gzip'
       };
-      const requestBody = {};
       
-      const response = await fetch(modelsUrl, {
-        method: 'POST',
-        headers: requestHeaders,
-        body: JSON.stringify(requestBody)
-      });
+      let modelsData = {};
       
-      if (response.ok) {
-        const data = await response.json();
+      // 使用 project_id_0 获取配额
+      try {
+        const pid0 = account.project_id_0 || '';
+        const response0 = await fetch(modelsUrl, {
+          method: 'POST',
+          headers: requestHeaders,
+          body: JSON.stringify({ project: pid0 })
+        });
         
-        if (data.models) {
-          await quotaService.updateQuotasFromModels(cookie_id, data.models);
+        if (response0.ok) {
+          const data0 = await response0.json();
+          modelsData = data0.models || {};
+        } else {
+          logger.warn(`[配额刷新] project_id_0 获取失败: HTTP ${response0.status}`);
         }
+      } catch (error) {
+        logger.warn(`[配额刷新] project_id_0 获取配额失败: ${error.message}`);
+      }
+      
+      // 更新到数据库
+      if (Object.keys(modelsData).length > 0) {
+        await quotaService.updateQuotasFromModels(cookie_id, modelsData);
       }
     } catch (error) {
       logger.warn(`刷新quota失败: cookie_id=${cookie_id}`, error.message);
@@ -507,6 +560,94 @@ class MultiAccountClient {
     // 返回更新后的quota值
     const quotaInfo = await quotaService.getQuota(cookie_id, model_name);
     return quotaInfo ? quotaInfo.quota : null;
+  }
+
+  /**
+   * 生成图片（使用多账号）
+   * @param {Object} requestBody - 请求体
+   * @param {string} user_id - 用户ID
+   * @param {string} model_name - 模型名称
+   * @param {Object} user - 用户对象
+   * @param {Object} account - 账号对象（可选，如果不提供则自动获取）
+   * @returns {Promise<Object>} 图片生成响应
+   */
+  async generateImage(requestBody, user_id, model_name, user, account = null, excludeProjectIds = []) {
+    // 如果没有提供 account，则获取一个
+    if (!account) {
+      account = await this.getAvailableAccount(user_id, model_name, user);
+    }
+    
+    logger.info(`开始图片生成 - cookie_id=${account.cookie_id}, model=${model_name}`);
+    
+    // 使用账号的 project_id_0
+    if (account.project_id_0) {
+      requestBody.project = account.project_id_0;
+    }
+    
+    const url = config.api.url;
+    
+    const requestHeaders = {
+      'Host': config.api.host,
+      'User-Agent': config.api.userAgent,
+      'Authorization': `Bearer ${account.access_token}`,
+      'Content-Type': 'application/json',
+      'Accept-Encoding': 'gzip'
+    };
+
+    
+    let response;
+    
+    try {
+      // 创建 AbortController 用于超时控制
+      const controller = new AbortController();
+      const timeout = setTimeout(() => {
+        controller.abort();
+      }, 600000); // 10分钟超时
+      
+      try {
+        response = await fetch(url, {
+          method: 'POST',
+          headers: requestHeaders,
+          body: JSON.stringify(requestBody),
+          signal: controller.signal
+        });
+      } finally {
+        clearTimeout(timeout);
+      }
+      
+      if (!response.ok) {
+        const responseText = await response.text();
+        
+        if (response.status === 403) {
+          logger.warn(`账号没有使用权限，已禁用: cookie_id=${account.cookie_id}`);
+          await accountService.updateAccountStatus(account.cookie_id, 0);
+        }
+        
+        // 检查是否是配额耗尽错误（400或429）
+        if (response.status === 400 || response.status === 429 || responseText.includes('quota') || responseText.includes('RESOURCE_EXHAUSTED')) {
+          logger.error(`[图片生成-配额错误] project_id_0 配额耗尽 (HTTP ${response.status})`);
+          throw new ApiError('RESOURCE_EXHAUSTED', response.status, 'RESOURCE_EXHAUSTED');
+        } else {
+          throw new ApiError(responseText, response.status, responseText);
+        }
+      }
+      
+    } catch (error) {
+      throw error;
+    }
+
+    // 解析响应
+    const data = await response.json();
+    
+    // 图片生成完成后，更新配额信息
+    try {
+      await this.refreshCookieQuota(account.cookie_id, account.access_token);
+      logger.info(`图片生成完成，配额已更新 - cookie_id=${account.cookie_id}`);
+    } catch (error) {
+      logger.error('更新配额失败:', error.message);
+    }
+    
+    return data;
   }
 }
 

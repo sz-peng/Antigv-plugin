@@ -612,31 +612,44 @@ router.get('/api/accounts/:cookie_id/quotas', authenticateApiKey, async (req, re
       }
     }
 
-    // 从API获取最新配额信息
+    // 从API获取最新配额信息（使用两个projectId）
     logger.info(`从API获取配额信息: cookie_id=${cookie_id}`);
-    const response = await fetch(config.api.modelsUrl, {
-      method: 'POST',
-      headers: {
-        'Host': config.api.host,
-        'User-Agent': config.api.userAgent,
-        'Authorization': `Bearer ${account.access_token}`,
-        'Content-Type': 'application/json',
-        'Accept-Encoding': 'gzip'
-      },
-      body: JSON.stringify({})
-    });
+    
+    let modelsData = {};
+    
+    // 使用 project_id_0 获取配额
+    try {
+      const pid0 = account.project_id_0 || '';
+      logger.info(`  使用 project_id_0: ${pid0 || '(空)'}`);
+      const response0 = await fetch(config.api.modelsUrl, {
+        method: 'POST',
+        headers: {
+          'Host': config.api.host,
+          'User-Agent': config.api.userAgent,
+          'Authorization': `Bearer ${account.access_token}`,
+          'Content-Type': 'application/json',
+          'Accept-Encoding': 'gzip'
+        },
+        body: JSON.stringify({ project: pid0 })
+      });
 
-    if (!response.ok) {
-      const errorText = await response.text();
-      throw new Error(`获取配额失败 (${response.status}): ${errorText}`);
+      if (response0.ok) {
+        const data0 = await response0.json();
+        modelsData = data0.models || {};
+        logger.info(`  project_id_0 获取成功: ${Object.keys(modelsData).length} 个模型`);
+      } else {
+        logger.warn(`  project_id_0 获取失败: ${response0.status}`);
+      }
+    } catch (error) {
+      logger.warn(`  project_id_0 获取失败: ${error.message}`);
     }
 
-    const data = await response.json();
-
     // 更新配额信息到数据库
-    if (data.models) {
-      await quotaService.updateQuotasFromModels(cookie_id, data.models);
+    if (Object.keys(modelsData).length > 0) {
+      await quotaService.updateQuotasFromModels(cookie_id, modelsData);
       logger.info(`配额信息已更新: cookie_id=${cookie_id}`);
+    } else {
+      throw new Error('无法获取配额信息');
     }
 
     // 从数据库获取更新后的配额
@@ -890,7 +903,12 @@ router.get('/v1/models', authenticateApiKey, async (req, res) => {
  * Header: X-Account-Type: antigravity (默认) 或 kiro
  */
 router.post('/v1/chat/completions', authenticateApiKey, async (req, res) => {
-  const { messages, model, stream = true, tools, tool_choice, ...params } = req.body;
+  const { messages, model, stream = true, tools, tool_choice, image_config, ...params } = req.body;
+  
+  // 如果提供了 image_config，将其添加到 params 中
+  if (image_config) {
+    params.image_config = image_config;
+  }
 
   // 参数验证错误仍返回400
   if (!messages) {
@@ -1007,7 +1025,9 @@ router.post('/v1/chat/completions', authenticateApiKey, async (req, res) => {
     }
   } else {
     // 使用 antigravity 账号系统（默认）
-    const requestBody = generateRequestBody(messages, model, params, tools);
+    // 先获取账号信息以便传递给 generateRequestBody
+    const account = await multiAccountClient.getAvailableAccount(req.user.user_id, model, req.user);
+    const requestBody = await generateRequestBody(messages, model, params, tools, req.user.user_id, account);
 
     // 计算输入token数
     const inputText = messages.map(m => {
@@ -1032,9 +1052,32 @@ router.post('/v1/chat/completions', authenticateApiKey, async (req, res) => {
       let fullContent = ''; // 累积输出内容用于计算token
       let toolCallArgs = ''; // 累积工具调用参数用于计算token
 
+      let reasoningContent = ''; // 累积 reasoning_content
+      let hasError = false; // 标记是否发生错误
+      
       try {
         await multiAccountClient.generateResponse(requestBody, (data) => {
-          if (data.type === 'tool_calls') {
+          if (data.type === 'error') {
+            // 处理错误：在流中发送错误信息
+            hasError = true;
+            res.write(`data: ${JSON.stringify({
+              id,
+              object: 'chat.completion.chunk',
+              created,
+              model,
+              choices: [{ index: 0, delta: { content: `\n\n错误: ${data.content}` }, finish_reason: null }]
+            })}\n\n`);
+            res.write(`data: ${JSON.stringify({
+              id,
+              object: 'chat.completion.chunk',
+              created,
+              model,
+              choices: [{ index: 0, delta: {}, finish_reason: 'stop' }]
+            })}\n\n`);
+            res.write('data: [DONE]\n\n');
+            res.end();
+            return;
+          } else if (data.type === 'tool_calls') {
             hasToolCall = true;
             // 累积工具调用内容用于token计算
             toolCallArgs += data.tool_calls.map(tc => tc.function?.name + (tc.function?.arguments || '')).join('');
@@ -1048,6 +1091,16 @@ router.post('/v1/chat/completions', authenticateApiKey, async (req, res) => {
           } else if (data.type === 'image') {
             // 收集图像数据,稍后一起返回
             collectedImages.push(data.image);
+          } else if (data.type === 'reasoning') {
+            // Gemini 的思考内容转换为 OpenAI 兼容的 reasoning_content 格式
+            reasoningContent += data.content || '';
+            res.write(`data: ${JSON.stringify({
+              id,
+              object: 'chat.completion.chunk',
+              created,
+              model,
+              choices: [{ index: 0, delta: { reasoning_content: data.content }, finish_reason: null }]
+            })}\n\n`);
           } else {
             fullContent += data.content || ''; // 累积内容
             res.write(`data: ${JSON.stringify({
@@ -1058,7 +1111,12 @@ router.post('/v1/chat/completions', authenticateApiKey, async (req, res) => {
               choices: [{ index: 0, delta: { content: data.content }, finish_reason: null }]
             })}\n\n`);
           }
-        }, req.user.user_id, model, req.user);
+        }, req.user.user_id, model, req.user, messages, account);
+
+        // 如果已经发生错误并结束了响应，直接返回
+        if (hasError) {
+          return;
+        }
 
         // 如果有生成的图像,在结束前以base64格式返回
         if (collectedImages.length > 0) {
@@ -1119,6 +1177,7 @@ router.post('/v1/chat/completions', authenticateApiKey, async (req, res) => {
       // 非流式响应：正常错误处理
       try {
         let fullContent = '';
+        let reasoningContent = ''; // 累积 reasoning_content
         let toolCalls = [];
         let collectedImages = [];
         let toolCallArgs = ''; // 累积工具调用参数用于计算token
@@ -1129,10 +1188,13 @@ router.post('/v1/chat/completions', authenticateApiKey, async (req, res) => {
             toolCallArgs += data.tool_calls.map(tc => tc.function?.name + (tc.function?.arguments || '')).join('');
           } else if (data.type === 'image') {
             collectedImages.push(data.image);
+          } else if (data.type === 'reasoning') {
+            // Gemini 的思考内容
+            reasoningContent += data.content || '';
           } else {
             fullContent += data.content || '';
           }
-        }, req.user.user_id, model, req.user);
+        }, req.user.user_id, model, req.user, messages, account);
 
         // 如果有生成的图像,将其添加到响应内容中
         if (collectedImages.length > 0) {
@@ -1148,6 +1210,9 @@ router.post('/v1/chat/completions', authenticateApiKey, async (req, res) => {
         const totalTokens = promptTokens + completionTokens;
 
         const message = { role: 'assistant', content: fullContent };
+        if (reasoningContent) {
+          message.reasoning_content = reasoningContent;
+        }
         if (toolCalls.length > 0) {
           message.tool_calls = toolCalls;
         }
@@ -1175,6 +1240,95 @@ router.post('/v1/chat/completions', authenticateApiKey, async (req, res) => {
         res.status(statusCode).json({ error: errorMessage });
       }
     }
+  }
+});
+
+/**
+ * Gemini 图片生成接口
+ * POST /v1beta/models/{model}:generateContent
+ * Body: { contents, generationConfig }
+ */
+router.post('/v1beta/models/:model\\:generateContent', authenticateApiKey, async (req, res) => {
+  // 设置10分钟超时（图片生成可能需要较长时间）
+  req.setTimeout(600000); // 10分钟 = 600000毫秒
+  res.setTimeout(600000);
+  
+  try {
+    const { model } = req.params;
+    const { contents, generationConfig } = req.body;
+
+    // 验证必需参数
+    if (!contents || !Array.isArray(contents) || contents.length === 0) {
+      return res.status(400).json({
+        error: {
+          code: 400,
+          message: 'contents是必需的且必须是非空数组',
+          status: 'INVALID_ARGUMENT'
+        }
+      });
+    }
+
+    // 提取提示词（从第一个用户消息中）
+    let prompt = '';
+    for (const content of contents) {
+      if (content.role === 'user' && content.parts) {
+        for (const part of content.parts) {
+          if (part.text) {
+            prompt += part.text;
+          }
+        }
+      }
+    }
+
+    if (!prompt) {
+      return res.status(400).json({
+        error: {
+          code: 400,
+          message: '未找到有效的文本提示词',
+          status: 'INVALID_ARGUMENT'
+        }
+      });
+    }
+
+    // 提取 imageConfig 参数
+    const imageConfig = {};
+    if (generationConfig?.imageConfig) {
+      if (generationConfig.imageConfig.aspectRatio) {
+        imageConfig.aspect_ratio = generationConfig.imageConfig.aspectRatio;
+      }
+      if (generationConfig.imageConfig.imageSize) {
+        imageConfig.image_size = generationConfig.imageConfig.imageSize;
+      }
+    }
+
+    // 获取账号信息
+    const account = await multiAccountClient.getAvailableAccount(req.user.user_id, model, req.user);
+    
+    // 生成请求体
+    const { generateImageRequestBody } = await import('../utils/utils.js');
+    const requestBody = generateImageRequestBody(prompt, model, imageConfig, account);
+
+    // 调用图片生成API
+    const data = await multiAccountClient.generateImage(
+      requestBody,
+      req.user.user_id,
+      model,
+      req.user,
+      account
+    );
+
+    // 返回 Gemini 格式的响应
+    res.json(data);
+  } catch (error) {
+    logger.error('图片生成失败:', error.message);
+    const statusCode = error.statusCode || 500;
+    res.status(statusCode).json({
+      error: {
+        code: statusCode,
+        message: error.message,
+        status: 'INTERNAL'
+      }
+    });
   }
 });
 

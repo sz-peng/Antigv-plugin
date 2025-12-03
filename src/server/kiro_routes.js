@@ -789,10 +789,6 @@ router.post('/v1/kiro/chat/completions', authenticateApiKey, async (req, res) =>
 
   if (stream) {
     // 流式响应
-    res.setHeader('Content-Type', 'text/event-stream');
-    res.setHeader('Cache-Control', 'no-cache');
-    res.setHeader('Connection', 'keep-alive');
-
     const id = `chatcmpl-${Date.now()}`;
     const created = Math.floor(Date.now() / 1000);
     let hasToolCall = false;
@@ -801,6 +797,12 @@ router.post('/v1/kiro/chat/completions', authenticateApiKey, async (req, res) =>
     let toolCallIndex = 0; // 跟踪工具调用索引
 
     try {
+      // 先尝试获取账号，如果失败则返回错误状态码
+      // 设置流式响应头
+      res.setHeader('Content-Type', 'text/event-stream');
+      res.setHeader('Cache-Control', 'no-cache');
+      res.setHeader('Connection', 'keep-alive');
+      
       await kiroClient.generateResponse(messages, model, (data) => {
         if (data.type === 'tool_call_start') {
           // OpenAI 流式格式：首次发送工具调用（包含 id, type, function.name）
@@ -896,22 +898,49 @@ router.post('/v1/kiro/chat/completions', authenticateApiKey, async (req, res) =>
       res.end();
     } catch (error) {
       logger.error('Kiro生成响应失败:', error.message);
-      res.write(`data: ${JSON.stringify({
-        id,
-        object: 'chat.completion.chunk',
-        created,
-        model,
-        choices: [{ index: 0, delta: { content: `\n\n错误: ${error.message}` }, finish_reason: null }]
-      })}\n\n`);
-      res.write(`data: ${JSON.stringify({
-        id,
-        object: 'chat.completion.chunk',
-        created,
-        model,
-        choices: [{ index: 0, delta: {}, finish_reason: 'stop' }]
-      })}\n\n`);
-      res.write('data: [DONE]\n\n');
-      res.end();
+      
+      // 根据错误类型返回适当的状态码
+      let statusCode = 500;
+      let errorMessage = error.message;
+      
+      // 检查是否是配额耗尽或无可用账号的错误
+      if (error.message.includes('没有可用的Kiro账号') ||
+          error.message.includes('配额') ||
+          error.message.includes('quota') ||
+          error.message.includes('limit')) {
+        statusCode = 429; // Too Many Requests
+        errorMessage = '所有账号配额已耗尽，请稍后再试';
+      } else if (error.message.includes('认证') ||
+                 error.message.includes('授权') ||
+                 error.message.includes('token')) {
+        statusCode = 401; // Unauthorized
+      }
+      
+      // 对于流式响应，如果还没有发送响应头，则设置状态码
+      if (!res.headersSent) {
+        res.status(statusCode).json({
+          error: errorMessage,
+          type: statusCode === 429 ? 'insufficient_quota' : 'api_error'
+        });
+      } else {
+        // 如果已经开始发送流式数据，则在流中发送错误信息
+        res.write(`data: ${JSON.stringify({
+          id,
+          object: 'chat.completion.chunk',
+          created,
+          model,
+          choices: [{ index: 0, delta: { content: `\n\n错误: ${errorMessage}` }, finish_reason: null }]
+        })}\n\n`);
+        res.write(`data: ${JSON.stringify({
+          id,
+          object: 'chat.completion.chunk',
+          created,
+          model,
+          choices: [{ index: 0, delta: {}, finish_reason: 'stop' }]
+        })}\n\n`);
+        res.write('data: [DONE]\n\n');
+        res.end();
+      }
     }
   } else {
     // 非流式响应
@@ -979,7 +1008,31 @@ router.post('/v1/kiro/chat/completions', authenticateApiKey, async (req, res) =>
       });
     } catch (error) {
       logger.error('Kiro生成响应失败:', error.message);
-      res.status(500).json({ error: error.message });
+      
+      // 根据错误类型返回适当的状态码
+      let statusCode = 500;
+      let errorMessage = error.message;
+      let errorType = 'api_error';
+      
+      // 检查是否是配额耗尽或无可用账号的错误
+      if (error.message.includes('没有可用的Kiro账号') ||
+          error.message.includes('配额') ||
+          error.message.includes('quota') ||
+          error.message.includes('limit')) {
+        statusCode = 429; // Too Many Requests
+        errorMessage = '所有账号配额已耗尽，请稍后再试';
+        errorType = 'insufficient_quota';
+      } else if (error.message.includes('认证') ||
+                 error.message.includes('授权') ||
+                 error.message.includes('token')) {
+        statusCode = 401; // Unauthorized
+        errorType = 'authentication_error';
+      }
+      
+      res.status(statusCode).json({
+        error: errorMessage,
+        type: errorType
+      });
     }
   }
 });

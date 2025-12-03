@@ -18,6 +18,7 @@ function generateProjectId() {
   const randomNum = Math.random().toString(36).substring(2, 7);
   return `${randomAdj}-${randomNoun}-${randomNum}`;
 }
+
 function extractImagesFromContent(content) {
   const result = { text: '', images: [] };
 
@@ -84,7 +85,7 @@ function handleAssistantMessage(message, antigravityMessages, isImageModel = fal
   
   // 安全处理 tool_calls，防止 undefined.map() 错误
   const toolCallsArray = Array.isArray(message.tool_calls) ? message.tool_calls : [];
-  const antigravityTools = hasToolCalls ? toolCallsArray.map(toolCall => {
+  const antigravityTools = hasToolCalls ? toolCallsArray.map((toolCall, index) => {
     let argsObj;
     try {
       argsObj = typeof toolCall.function.arguments === 'string'
@@ -94,13 +95,15 @@ function handleAssistantMessage(message, antigravityMessages, isImageModel = fal
       argsObj = {};
     }
     
-    return {
+    const functionCallObj = {
       functionCall: {
         id: toolCall.id,
         name: toolCall.function.name,
         args: argsObj
       }
     };
+    
+    return functionCallObj;
   }) : [];
   
   if (lastMessage?.role === "model" && hasToolCalls && !hasContent){
@@ -138,7 +141,11 @@ function handleAssistantMessage(message, antigravityMessages, isImageModel = fal
           for (const match of thinkMatches) {
             const thinkContent = match.replace(/<\/?think>/g, '').trim();
             if (thinkContent) {
-              parts.push({ text: thinkContent, thought: true });
+              parts.push({
+                text: thinkContent,
+                thought: true,
+                thoughtSignature: ""
+              });
             }
           }
         }
@@ -183,7 +190,6 @@ function handleAssistantMessage(message, antigravityMessages, isImageModel = fal
   }
 }
 function handleToolCall(message, antigravityMessages){
-  // 从之前的 model 消息中找到对应的 functionCall name
   let functionName = '';
   for (let i = antigravityMessages.length - 1; i >= 0; i--) {
     if (antigravityMessages[i].role === 'model') {
@@ -257,10 +263,16 @@ function openaiMessageToAntigravity(openaiMessages, enableThinking, isCompletion
   return antigravityMessages;
 }
 function generateGenerationConfig(parameters, enableThinking, actualModelName, isNonChatModel = false){
+  // thinking 模型的 max_tokens 最小值为 2048
+  let maxOutputTokens = parameters.max_tokens ?? config.defaults.max_tokens;
+  if (enableThinking && maxOutputTokens < 2048) {
+    maxOutputTokens = 2048;
+  }
+  
   const generationConfig = {
     temperature: parameters.temperature ?? config.defaults.temperature,
     candidateCount: 1,
-    maxOutputTokens: parameters.max_tokens ?? config.defaults.max_tokens
+    maxOutputTokens: maxOutputTokens
   };
   
   // 非对话模型使用最简配置
@@ -289,6 +301,21 @@ function generateGenerationConfig(parameters, enableThinking, actualModelName, i
   
   if (enableThinking && actualModelName.includes("claude")){
     delete generationConfig.topP;
+  }
+  
+  // 图片生成模型支持 imageConfig 参数
+  if (actualModelName.endsWith('-image') && parameters.image_config) {
+    generationConfig.imageConfig = {};
+    
+    // 支持 aspect_ratio 参数（如 "16:9", "4:3", "1:1" 等）
+    if (parameters.image_config.aspect_ratio) {
+      generationConfig.imageConfig.aspectRatio = parameters.image_config.aspect_ratio;
+    }
+    
+    // 支持 image_size 参数（如 "4K", "1080p" 等）
+    if (parameters.image_config.image_size) {
+      generationConfig.imageConfig.imageSize = parameters.image_config.image_size;
+    }
   }
   
   return generationConfig;
@@ -389,7 +416,49 @@ function convertOpenAIToolsToAntigravity(openaiTools){
     };
   });
 }
-function generateRequestBody(openaiMessages,modelName,parameters,openaiTools){
+
+/**
+ * 将存储的 signatures 注入到 contents 中
+ * @param {Array} contents - Antigravity 格式的消息数组
+ * @param {Array} signatures - 存储的 signature 数组
+ */
+function injectSignatures(contents, signatures) {
+  if (!contents || !signatures || signatures.length === 0) {
+    return;
+  }
+  
+  // 找到最后一条 model 消息
+  const lastModelMessage = [...contents].reverse().find(msg => msg.role === 'model');
+  if (!lastModelMessage || !lastModelMessage.parts) {
+    return;
+  }
+  
+  // 注入 signatures 到对应的 parts
+  for (const sig of signatures) {
+    if (sig.type === 'functionCall' && sig.functionId) {
+      // 查找对应的 functionCall
+      const part = lastModelMessage.parts.find(p =>
+        p.functionCall && p.functionCall.id === sig.functionId
+      );
+      if (part && !part.thoughtSignature) {
+        part.thoughtSignature = sig.signature;
+      }
+    } else if (sig.type === 'text' && sig.index !== undefined) {
+      // 根据索引注入到对应的 text part
+      if (lastModelMessage.parts[sig.index] && !lastModelMessage.parts[sig.index].thoughtSignature) {
+        lastModelMessage.parts[sig.index].thoughtSignature = sig.signature;
+      }
+    }
+  }
+}
+
+async function generateRequestBody(openaiMessages, modelName, parameters, openaiTools, user_id = null, account = null){
+  // Gemini 2.5 Flash Thinking 路由到 Gemini 2.5 Flash
+  let actualModelName = modelName;
+  if (modelName === 'gemini-2.5-flash-thinking') {
+    actualModelName = 'gemini-2.5-flash';
+  }
+  
   const enableThinking = modelName.endsWith('-thinking') ||
     modelName === 'gemini-2.5-pro' ||
     modelName.startsWith('gemini-3-pro-') ||
@@ -397,7 +466,7 @@ function generateRequestBody(openaiMessages,modelName,parameters,openaiTools){
     modelName === "gpt-oss-120b-medium"
   
   // 用于生成配置的基础模型名（去掉-thinking后缀用于某些配置判断）
-  const baseModelName = modelName.endsWith('-thinking') ? modelName.slice(0, -9) : modelName;
+  const baseModelName = actualModelName.endsWith('-thinking') ? actualModelName.slice(0, -9) : actualModelName;
   
   // 检测并拒绝不支持的模型类型
   const isChatModel = baseModelName.startsWith('chat_');  // chat_ 开头的内部补全模型
@@ -406,14 +475,42 @@ function generateRequestBody(openaiMessages,modelName,parameters,openaiTools){
     throw new Error(`Unsupported completion model: ${baseModelName}`);
   }
   
+  // 如果启用 thinking 且提供了 user_id，尝试检索并注入 signatures
+  let storedSignatures = null;
+  if (enableThinking && user_id) {
+    try {
+      const { default: signatureService } = await import('../services/signature.service.js');
+      storedSignatures = await signatureService.retrieveSignatures(user_id, openaiMessages);
+    } catch (error) {
+      // 忽略错误，继续使用空 signature
+    }
+  }
+  
   // 标准对话模型使用标准格式
   const generationConfig = generateGenerationConfig(parameters, enableThinking, baseModelName, false);
   
+  const contents = openaiMessageToAntigravity(openaiMessages, enableThinking, false, baseModelName);
+  
+  // 如果有存储的 signatures，注入到对应的 parts 中
+  if (storedSignatures && storedSignatures.length > 0) {
+    injectSignatures(contents, storedSignatures);
+  }
+  
+  // 优先使用账号的 project_id_0，如果不存在则随机生成
+  let projectId = generateProjectId();
+  if (account) {
+    if (account.project_id_0 !== undefined && account.project_id_0 !== null) {
+      projectId = account.project_id_0;
+    } else {
+      logger.info(`账号没有配置 project_id，使用随机生成: ${projectId}`);
+    }
+  }
+  
   const requestBody = {
-    project: generateProjectId(),
+    project: projectId,
     requestId: generateRequestId(),
     request: {
-      contents: openaiMessageToAntigravity(openaiMessages, enableThinking, false, baseModelName),
+      contents: contents,
       generationConfig: generationConfig,
       sessionId: generateSessionId(),
       systemInstruction: {
@@ -421,7 +518,7 @@ function generateRequestBody(openaiMessages,modelName,parameters,openaiTools){
         parts: [{ text: config.systemInstruction }]
       }
     },
-    model: modelName,  // 使用用户请求的完整模型名（包括-thinking后缀）
+    model: actualModelName,
     userAgent: "antigravity"
   };
   
@@ -434,11 +531,74 @@ function generateRequestBody(openaiMessages,modelName,parameters,openaiTools){
     };
   }
   
+  // 不在这里打印请求体，因为projectId可能会在generateResponse中被修改
+  // 打印请求体的逻辑移到generateResponse中，在选择projectId之后
+  
   return requestBody;
 }
+/**
+ * 生成图片生成请求体
+ * @param {string} prompt - 图片生成提示词
+ * @param {string} modelName - 模型名称
+ * @param {Object} imageConfig - 图片配置参数
+ * @param {Object} account - 账号对象（可选，包含project_id_0）
+ * @returns {Object} 请求体
+ */
+function generateImageRequestBody(prompt, modelName, imageConfig = {}, account = null) {
+  // 优先使用账号的 project_id_0，如果不存在则随机生成
+  let projectId = generateProjectId();
+  if (account) {
+    if (account.project_id_0 !== undefined && account.project_id_0 !== null) {
+      projectId = account.project_id_0;
+    } else {
+      logger.info(`图片生成账号没有配置 project_id，使用随机生成: ${projectId}`);
+    }
+  }
+  
+  const requestBody = {
+    project: projectId,
+    requestId: generateRequestId(),
+    request: {
+      contents: [
+        {
+          role: "user",
+          parts: [
+            {
+              text: prompt
+            }
+          ]
+        }
+      ],
+      generationConfig: {
+        candidateCount: 1
+      }
+    },
+    model: modelName,
+    userAgent: "antigravity",
+    requestType: "image_gen"
+  };
+  
+  if (imageConfig && Object.keys(imageConfig).length > 0) {
+    requestBody.request.generationConfig.imageConfig = {};
+    if (imageConfig.aspect_ratio) {
+      requestBody.request.generationConfig.imageConfig.aspectRatio = imageConfig.aspect_ratio;
+    }
+    if (imageConfig.image_size) {
+      requestBody.request.generationConfig.imageConfig.imageSize = imageConfig.image_size;
+    }
+  }
+  
+  // 不在这里打印请求体，因为projectId可能会在generateImage中被修改
+  // 打印请求体的逻辑移到generateImage中，在选择projectId之后
+  
+  return requestBody;
+}
+
 export{
   generateRequestId,
   generateSessionId,
   generateProjectId,
-  generateRequestBody
+  generateRequestBody,
+  generateImageRequestBody,
+  injectSignatures
 }

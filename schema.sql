@@ -119,6 +119,8 @@ CREATE TABLE public.accounts (
     refresh_token text,
     expires_at bigint,
     status smallint DEFAULT 1 NOT NULL,
+    project_id_0 character varying(255) DEFAULT '',
+    is_restricted boolean DEFAULT false NOT NULL,
     created_at timestamp without time zone DEFAULT CURRENT_TIMESTAMP,
     updated_at timestamp without time zone DEFAULT CURRENT_TIMESTAMP
 );
@@ -180,6 +182,20 @@ COMMENT ON COLUMN public.accounts.expires_at IS '令牌过期时间（时间戳�
 --
 
 COMMENT ON COLUMN public.accounts.status IS '账号状态: 0=禁用, 1=启用';
+
+
+--
+-- Name: COLUMN accounts.project_id_0; Type: COMMENT; Schema: public; Owner: antigravity
+--
+
+COMMENT ON COLUMN public.accounts.project_id_0 IS 'Google Cloud项目ID（从API获取）';
+
+
+--
+-- Name: COLUMN accounts.is_restricted; Type: COMMENT; Schema: public; Owner: antigravity
+--
+
+COMMENT ON COLUMN public.accounts.is_restricted IS '是否受地区限制: false=不受限, true=受限';
 
 
 --

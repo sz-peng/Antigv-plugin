@@ -4,6 +4,7 @@ import logger from '../utils/logger.js';
 import config from '../config/config.js';
 import accountService from './account.service.js';
 import quotaService from './quota.service.js';
+import projectService from './project.service.js';
 
 const CLIENT_ID = '1071006060591-tmhssin2h21lcre235vtolojh4g403ep.apps.googleusercontent.com';
 const CLIENT_SECRET = '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';
@@ -376,6 +377,52 @@ class OAuthService {
   }
 
   /**
+   * 获取用户信息（email等）
+   * @param {string} access_token - 访问令牌
+   * @returns {Promise<Object>} 用户信息
+   */
+  async getUserInfo(access_token) {
+    return new Promise((resolve, reject) => {
+      const options = {
+        hostname: 'www.googleapis.com',
+        path: '/oauth2/v2/userinfo',
+        method: 'GET',
+        headers: {
+          'Authorization': `Bearer ${access_token}`
+        }
+      };
+
+      const req = https.request(options, (res) => {
+        let body = '';
+        
+        res.on('data', chunk => {
+          body += chunk;
+        });
+        
+        res.on('end', () => {
+          if (res.statusCode === 200) {
+            try {
+              const userInfo = JSON.parse(body);
+              resolve(userInfo);
+            } catch (parseError) {
+              reject(new Error(`解析失败: ${parseError.message}`));
+            }
+          } else {
+            reject(new Error(`HTTP ${res.statusCode}: ${body}`));
+          }
+        });
+      });
+
+      req.on('error', (error) => {
+        logger.error('获取用户信息请求异常:', error.message);
+        reject(error);
+      });
+
+      req.end();
+    });
+  }
+
+  /**
    * 处理OAuth回调
    * @param {string} code - 授权码
    * @param {string} state - State参数
@@ -403,54 +450,117 @@ class OAuthService {
     // 计算过期时间
     const expires_at = Date.now() + (tokenData.expires_in * 1000);
 
-    // 先验证账号权限：尝试获取模型列表
-    logger.info(`验证账号权限: cookie_id=${cookie_id}`);
-    const response = await fetch(config.api.modelsUrl, {
-      method: 'POST',
-      headers: {
-        'Host': config.api.host,
-        'User-Agent': config.api.userAgent,
-        'Authorization': `Bearer ${tokenData.access_token}`,
-        'Content-Type': 'application/json',
-        'Accept-Encoding': 'gzip'
-      },
-      body: JSON.stringify({})
-    });
-
-    if (!response.ok) {
-      const errorText = await response.text();
-      logger.error(`账号无权限访问API (${response.status}): ${errorText}`);
-      throw new Error(`该账号无权限使用Antigravity API。错误: ${response.status} - ${errorText}`);
+    // 获取用户信息（email）
+    let accountName = null;
+    try {
+      const userInfo = await this.getUserInfo(tokenData.access_token);
+      if (userInfo.email) {
+        accountName = userInfo.email;
+        logger.info(`获取到账号email: ${accountName}`);
+      }
+    } catch (error) {
+      logger.warn(`获取用户信息失败，将使用默认名称: ${error.message}`);
     }
 
-    const data = await response.json();
+    // 第一步：获取project_id并检查账号资格
+    let project_id_0 = '';
+    let is_restricted = false;
     
-    if (!data.models || Object.keys(data.models).length === 0) {
-      logger.error('账号返回的模型列表为空');
-      throw new Error('该账号无可用模型，请检查账号权限');
+    try {
+      const projectData = await projectService.loadCodeAssist(tokenData.access_token);
+      
+      // 检查是否为 INELIGIBLE_ACCOUNT
+      if (projectData.ineligibleTiers && projectData.ineligibleTiers.length > 0) {
+        const hasIneligibleAccount = projectData.ineligibleTiers.some(
+          tier => tier.reasonCode === 'INELIGIBLE_ACCOUNT'
+        );
+        
+        if (hasIneligibleAccount) {
+          logger.error(`账号不符合使用条件 (INELIGIBLE_ACCOUNT): cookie_id=${cookie_id}`);
+          this.stateMap.delete(state);
+          throw new Error('此账号没有资格使用Antigravity，请更换账号重试');
+        }
+        
+        // 检查是否为 UNSUPPORTED_LOCATION
+        const hasUnsupportedLocation = projectData.ineligibleTiers.some(
+          tier => tier.reasonCode === 'UNSUPPORTED_LOCATION'
+        );
+        
+        if (hasUnsupportedLocation) {
+          is_restricted = true;
+          logger.info(`账号受地区限制: cookie_id=${cookie_id}`);
+        }
+      }
+      
+      // 获取project_id_0
+      if (!is_restricted && projectData.cloudaicompanionProject) {
+        project_id_0 = projectData.cloudaicompanionProject;
+      }
+      
+    } catch (error) {
+      // 如果是 INELIGIBLE_ACCOUNT 错误，直接抛出
+      if (error.message.includes('INELIGIBLE_ACCOUNT') || error.message.includes('请更换账号重试')) {
+        throw error;
+      }
+      // 其他错误不阻止登录
+      logger.warn(`project_id获取失败，但允许继续登录: cookie_id=${cookie_id}, error=${error.message}`);
     }
 
-    // 权限验证通过，创建账号
+    let mergedModels = {};
+    
+    // 使用project_id_0获取配额
+    if (project_id_0) {
+      try {
+        const response0 = await fetch(config.api.modelsUrl, {
+          method: 'POST',
+          headers: {
+            'Host': config.api.host,
+            'User-Agent': config.api.userAgent,
+            'Authorization': `Bearer ${tokenData.access_token}`,
+            'Content-Type': 'application/json',
+            'Accept-Encoding': 'gzip'
+          },
+          body: JSON.stringify({ project: project_id_0 })
+        });
+
+        if (response0.ok) {
+          const data0 = await response0.json();
+          if (data0.models) {
+            mergedModels = { ...data0.models };
+          }
+        } else {
+          logger.warn(`project_id_0配额获取失败: status=${response0.status}`);
+        }
+      } catch (error) {
+        logger.warn(`project_id_0配额获取异常: ${error.message}`);
+      }
+    }
+    
+    logger.info(`配额获取完成: cookie_id=${cookie_id}, 共${Object.keys(mergedModels).length}个模型`);
+
+    // 第三步：创建账号
     const account = await accountService.createAccount({
       cookie_id,
       user_id,
       is_shared,
       access_token: tokenData.access_token,
       refresh_token: tokenData.refresh_token,
-      expires_at
+      expires_at,
+      project_id_0,
+      is_restricted,
+      name: accountName
     });
 
-    // 更新model_quotas表（共享和专属cookie都需要）
-    await quotaService.updateQuotasFromModels(cookie_id, data.models);
+    // 更新model_quotas表
+    await quotaService.updateQuotasFromModels(cookie_id, mergedModels);
     
-    const modelNames = Object.keys(data.models);
+    const modelNames = Object.keys(mergedModels);
     
     // 如果是共享cookie，更新用户共享配额池上限（2*n）
     if (is_shared === 1) {
       for (const modelName of modelNames) {
         await quotaService.updateUserSharedQuotaMax(user_id, modelName);
       }
-      logger.info(`用户共享配额池上限已更新: user_id=${user_id}, ${modelNames.length}个模型`);
     }
 
     // 清除state映射
