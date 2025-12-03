@@ -7,7 +7,30 @@ const colors = {
   gray: '\x1b[90m'
 };
 
+// 日志级别优先级
+const LOG_LEVELS = {
+  debug: 0,
+  info: 1,
+  warn: 2,
+  error: 3
+};
+
+// 当前日志级别，默认为 info，可通过环境变量 LOG_LEVEL 设置
+let currentLogLevel = process.env.LOG_LEVEL || 'info';
+
+function setLogLevel(level) {
+  if (LOG_LEVELS[level] !== undefined) {
+    currentLogLevel = level;
+  }
+}
+
+function shouldLog(level) {
+  return LOG_LEVELS[level] >= LOG_LEVELS[currentLogLevel];
+}
+
 function logMessage(level, ...args) {
+  if (!shouldLog(level)) return;
+  
   const timestamp = new Date().toLocaleTimeString('zh-CN', { hour12: false });
   const color = { info: colors.green, warn: colors.yellow, error: colors.red, debug: colors.cyan }[level];
   console.log(`${colors.gray}${timestamp}${colors.reset} ${color}[${level}]${colors.reset}`, ...args);
@@ -28,7 +51,8 @@ export const log = {
   error: (...args) => logMessage('error', ...args),
   debug: (...args) => logMessage('debug', ...args),
   request: logRequest,
-  generateRequestId
+  generateRequestId,
+  setLogLevel
 };
 
 export default log;

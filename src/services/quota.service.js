@@ -16,6 +16,14 @@ class QuotaService {
       
       // Gemini 2.5 pro 系列共享配额
       'gemini-2.5-pro': ['gemini-2.5-pro', 'gemini-2.5-pro-thinking'],
+      
+      // Claude 和 GPT-OSS 共享配额（antigravity）
+      // 注意：这些模型在 antigravity 平台上共享同一个配额池
+      'claude-gpt-oss': [
+        'claude-sonnet-4-5',
+        'claude-sonnet-4-5-thinking',
+        'gpt-oss-120b-medium'
+      ],
     };
   }
 
@@ -88,8 +96,6 @@ class QuotaService {
          RETURNING *`,
         [cookie_id, model_name, reset_time, quota, status]
       );
-
-      logger.info(`配额已更新: cookie_id=${cookie_id}, model=${model_name}, quota=${quota}, status=${result.rows[0].status}`);
       return result.rows[0];
     } catch (error) {
       logger.error('更新配额失败:', error.message);
@@ -478,6 +484,31 @@ class QuotaService {
   }
 
   /**
+   * 获取配额已过期（reset_time 在当前时间之前）的共享账号列表
+   * 这些账号的配额可能已经重置，需要重新获取最新数据
+   * @returns {Promise<Array>} 需要刷新配额的账号列表（包含 cookie_id 和 access_token）
+   */
+  async getExpiredQuotaSharedAccounts() {
+    try {
+      const result = await database.query(
+        `SELECT DISTINCT a.cookie_id, a.access_token, a.refresh_token, a.expires_at
+         FROM accounts a
+         JOIN model_quotas mq ON a.cookie_id = mq.cookie_id
+         WHERE a.is_shared = 1
+           AND a.status = 1
+           AND a.need_refresh = FALSE
+           AND mq.reset_time IS NOT NULL
+           AND mq.reset_time < CURRENT_TIMESTAMP`
+      );
+      logger.info(`找到 ${result.rows.length} 个配额已过期的共享账号需要刷新`);
+      return result.rows;
+    } catch (error) {
+      logger.error('查询过期配额账号失败:', error.message);
+      throw error;
+    }
+  }
+
+  /**
    * 获取用户某个模型的配额
    * @param {string} user_id - 用户ID
    * @param {string} model_name - 模型名称
@@ -526,7 +557,13 @@ class QuotaService {
    */
   async recordQuotaConsumption(user_id, cookie_id, model_name, quota_before, quota_after, is_shared = 1) {
     try {
-      const quota_consumed = quota_before - quota_after;
+      let quota_consumed = quota_before - quota_after;
+      
+      // 如果消耗为负数（配额在请求期间重置），记录为0
+      if (quota_consumed < 0) {
+        logger.info(`配额在请求期间重置，记录消耗为0: quota_before=${quota_before}, quota_after=${quota_after}`);
+        quota_consumed = 0;
+      }
       
       const result = await database.query(
         `INSERT INTO quota_consumption_log (user_id, cookie_id, model_name, quota_before, quota_after, quota_consumed, is_shared)

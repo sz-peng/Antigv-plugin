@@ -2,7 +2,15 @@ import express from 'express';
 import logger from '../utils/logger.js';
 import config from '../config/config.js';
 import database from '../db/database.js';
+import redisService from '../services/redis.service.js';
 import routes from './routes.js';
+import kiroRoutes from './kiro_routes.js';
+
+// 设置日志级别
+if (config.logging?.level) {
+  logger.setLogLevel(config.logging.level);
+  logger.info(`日志级别设置为: ${config.logging.level}`);
+}
 
 const app = express();
 
@@ -16,6 +24,13 @@ database.ping().then(connected => {
   } else {
     logger.error('数据库连接失败，请检查配置');
   }
+});
+
+// 初始化Redis（用于Kiro OAuth状态存储）
+redisService.init().then(() => {
+  logger.info('Redis初始化成功');
+}).catch(err => {
+  logger.warn('Redis初始化失败，Kiro OAuth功能将不可用:', err.message);
 });
 
 app.use(express.json({ limit: config.security.maxRequestSize }));
@@ -37,6 +52,7 @@ app.use((req, res, next) => {
 
 // 使用路由（认证在routes.js中处理）
 app.use(routes);
+app.use(kiroRoutes);
 
 const server = app.listen(config.server.port, config.server.host, () => {
   logger.info(`服务器已启动: ${config.server.host}:${config.server.port}`);
@@ -59,6 +75,7 @@ const shutdown = async () => {
   logger.info('正在关闭服务器...');
   server.close(async () => {
     await database.close();
+    await redisService.close();
     logger.info('服务器已关闭');
     process.exit(0);
   });

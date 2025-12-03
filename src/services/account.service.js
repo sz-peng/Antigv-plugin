@@ -89,7 +89,7 @@ class AccountService {
    */
   async getAvailableAccounts(user_id = null, is_shared = null) {
     try {
-      let query = 'SELECT * FROM accounts WHERE status = 1';
+      let query = 'SELECT * FROM accounts WHERE status = 1 AND need_refresh = FALSE';
       const params = [];
       let paramIndex = 1;
 
@@ -150,6 +150,33 @@ class AccountService {
   }
 
   /**
+   * 标记账号需要重新刷新token（禁用账号并设置need_refresh=true）
+   * @param {string} cookie_id - Cookie ID
+   * @returns {Promise<Object>} 更新后的账号信息
+   */
+  async markAccountNeedRefresh(cookie_id) {
+    try {
+      const result = await database.query(
+        `UPDATE accounts
+         SET status = 0, need_refresh = TRUE, updated_at = CURRENT_TIMESTAMP
+         WHERE cookie_id = $1
+         RETURNING *`,
+        [cookie_id]
+      );
+
+      if (result.rows.length === 0) {
+        throw new Error(`账号不存在: cookie_id=${cookie_id}`);
+      }
+
+      logger.warn(`账号已标记需要刷新: cookie_id=${cookie_id}`);
+      return result.rows[0];
+    } catch (error) {
+      logger.error('标记账号需要刷新失败:', error.message);
+      throw error;
+    }
+  }
+
+  /**
    * 更新账号状态
    * @param {string} cookie_id - Cookie ID
    * @param {number} status - 状态 (0=禁用, 1=启用)
@@ -173,6 +200,34 @@ class AccountService {
       return result.rows[0];
     } catch (error) {
       logger.error('更新账号状态失败:', error.message);
+      throw error;
+    }
+  }
+
+  /**
+   * 更新账号名称
+   * @param {string} cookie_id - Cookie ID
+   * @param {string} name - 新的账号名称
+   * @returns {Promise<Object>} 更新后的账号信息
+   */
+  async updateAccountName(cookie_id, name) {
+    try {
+      const result = await database.query(
+        `UPDATE accounts
+         SET name = $1, updated_at = CURRENT_TIMESTAMP
+         WHERE cookie_id = $2
+         RETURNING *`,
+        [name, cookie_id]
+      );
+
+      if (result.rows.length === 0) {
+        throw new Error(`账号不存在: cookie_id=${cookie_id}`);
+      }
+
+      logger.info(`账号名称已更新: cookie_id=${cookie_id}, name=${name}`);
+      return result.rows[0];
+    } catch (error) {
+      logger.error('更新账号名称失败:', error.message);
       throw error;
     }
   }

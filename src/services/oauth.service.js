@@ -156,7 +156,6 @@ class OAuthService {
           chunkCount++;
           totalBytes += chunk.length;
           body += chunk;
-          logger.debug(`[${requestId}] 接收数据块 #${chunkCount}: ${chunk.length} bytes`);
         });
         
         res.on('end', () => {
@@ -275,12 +274,6 @@ class OAuthService {
 
       const req = https.request(options, (res) => {
         const responseStartTime = Date.now();
-        logger.info(`[${requestId}] 收到响应:`, {
-          status_code: res.statusCode,
-          status_message: res.statusMessage,
-          headers: res.headers,
-          http_version: res.httpVersion
-        });
         
         let body = '';
         let chunkCount = 0;
@@ -290,19 +283,11 @@ class OAuthService {
           chunkCount++;
           totalBytes += chunk.length;
           body += chunk;
-          logger.debug(`[${requestId}] 接收数据块 #${chunkCount}: ${chunk.length} bytes`);
         });
         
         res.on('end', () => {
           const totalTime = Date.now() - startTime;
           const responseTime = Date.now() - responseStartTime;
-          
-          logger.info(`[${requestId}] 响应接收完成:`, {
-            total_chunks: chunkCount,
-            total_bytes: totalBytes,
-            response_time_ms: responseTime,
-            total_time_ms: totalTime
-          });
           
           if (res.statusCode === 200) {
             try {
@@ -321,13 +306,44 @@ class OAuthService {
               reject(new Error(`JSON解析失败: ${parseError.message}`));
             }
           } else {
-            logger.error(`[${requestId}] Token刷新失败:`, {
+            // 解析错误响应以获取更详细的错误信息
+            let errorInfo = {
               status_code: res.statusCode,
               status_message: res.statusMessage,
               response_body: body,
               response_size: body.length
-            });
-            reject(new Error(`HTTP ${res.statusCode}: ${body}`));
+            };
+            
+            let isInvalidGrant = false;
+            try {
+              const errorData = JSON.parse(body);
+              errorInfo.error = errorData.error;
+              errorInfo.error_description = errorData.error_description;
+              
+              // 特别处理 invalid_grant 错误
+              if (errorData.error === 'invalid_grant') {
+                isInvalidGrant = true;
+                logger.error(`[${requestId}] Token刷新失败 - invalid_grant:`, {
+                  ...errorInfo,
+                  possible_causes: [
+                    'refresh_token已过期（Google refresh_token通常6个月后过期）',
+                    'refresh_token已被撤销',
+                    '用户已更改密码',
+                    '用户已撤销应用授权',
+                    'refresh_token已被使用过（某些情况下只能使用一次）'
+                  ]
+                });
+              } else {
+                logger.error(`[${requestId}] Token刷新失败:`, errorInfo);
+              }
+            } catch (parseErr) {
+              logger.error(`[${requestId}] Token刷新失败:`, errorInfo);
+            }
+            
+            // 创建错误对象，标记是否为 invalid_grant
+            const error = new Error(`HTTP ${res.statusCode}: ${body}`);
+            error.isInvalidGrant = isInvalidGrant;
+            reject(error);
           }
         });
       });
@@ -426,7 +442,6 @@ class OAuthService {
 
     // 更新model_quotas表（共享和专属cookie都需要）
     await quotaService.updateQuotasFromModels(cookie_id, data.models);
-    logger.info(`模型配额已更新: cookie_id=${cookie_id}, ${Object.keys(data.models).length}个模型`);
     
     const modelNames = Object.keys(data.models);
     

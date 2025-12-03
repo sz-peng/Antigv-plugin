@@ -49,11 +49,14 @@ class TokenManager {
     const response = await fetch('https://oauth2.googleapis.com/token', {
       method: 'POST',
       headers: {
+        'Accept': '*/*',
         'Host': 'oauth2.googleapis.com',
-        'User-Agent': 'Go-http-client/1.1',
+        'User-Agent': 'google-api-nodejs-client/10.3.0',
         'Content-Length': body.toString().length.toString(),
-        'Content-Type': 'application/x-www-form-urlencoded',
-        'Accept-Encoding': 'gzip'
+        'Content-Type': 'application/x-www-form-urlencoded;charset=UTF-8',
+        'Accept-Encoding': 'gzip, deflate, br',
+        'X-Goog-Api-Client': 'gl-node/22.18.0',
+        'Connection': 'keep-alive'
       },
       body: body.toString()
     });

@@ -7,6 +7,7 @@ import multiAccountClient from '../api/multi_account_client.js';
 import { generateRequestBody } from '../utils/utils.js';
 import logger from '../utils/logger.js';
 import config from '../config/config.js';
+import { countStringTokens } from '../utils/token_counter.js';
 
 const router = express.Router();
 
@@ -401,8 +402,10 @@ router.get('/api/accounts', authenticateApiKey, async (req, res) => {
     const safeAccounts = accounts.map(acc => ({
       cookie_id: acc.cookie_id,
       user_id: acc.user_id,
+      name: acc.name,
       is_shared: acc.is_shared,
       status: acc.status,
+      need_refresh: acc.need_refresh,
       expires_at: acc.expires_at,
       last_used_at: acc.last_used_at,
       created_at: acc.created_at,
@@ -441,8 +444,10 @@ router.get('/api/accounts/:cookie_id', authenticateApiKey, async (req, res) => {
     const safeAccount = {
       cookie_id: account.cookie_id,
       user_id: account.user_id,
+      name: account.name,
       is_shared: account.is_shared,
       status: account.status,
+      need_refresh: account.need_refresh,
       expires_at: account.expires_at,
       created_at: account.created_at,
       updated_at: account.updated_at
@@ -493,6 +498,49 @@ router.put('/api/accounts/:cookie_id/status', authenticateApiKey, async (req, re
     });
   } catch (error) {
     logger.error('更新账号状态失败:', error.message);
+    res.status(500).json({ error: error.message });
+  }
+});
+
+/**
+ * 更新账号名称
+ * PUT /api/accounts/:cookie_id/name
+ * Body: { name }
+ */
+router.put('/api/accounts/:cookie_id/name', authenticateApiKey, async (req, res) => {
+  try {
+    const { cookie_id } = req.params;
+    const { name } = req.body;
+
+    if (name === undefined || name === null) {
+      return res.status(400).json({ error: 'name是必需的' });
+    }
+
+    if (typeof name !== 'string' || name.length > 100) {
+      return res.status(400).json({ error: 'name必须是字符串且长度不超过100' });
+    }
+
+    // 检查权限
+    const existingAccount = await accountService.getAccountByCookieId(cookie_id);
+    if (!existingAccount) {
+      return res.status(404).json({ error: '账号不存在' });
+    }
+    if (!req.isAdmin && existingAccount.user_id !== req.user.user_id) {
+      return res.status(403).json({ error: '无权修改此账号' });
+    }
+
+    const account = await accountService.updateAccountName(cookie_id, name);
+
+    res.json({
+      success: true,
+      message: '账号名称已更新',
+      data: {
+        cookie_id: account.cookie_id,
+        name: account.name
+      }
+    });
+  } catch (error) {
+    logger.error('更新账号名称失败:', error.message);
     res.status(500).json({ error: error.message });
   }
 });
@@ -549,10 +597,19 @@ router.get('/api/accounts/:cookie_id/quotas', authenticateApiKey, async (req, re
     // 检查token是否过期，如果过期则刷新
     if (accountService.isTokenExpired(account)) {
       logger.info(`账号token已过期，正在刷新: cookie_id=${cookie_id}`);
-      const tokenData = await oauthService.refreshAccessToken(account.refresh_token);
-      const expires_at = Date.now() + (tokenData.expires_in * 1000);
-      await accountService.updateAccountToken(cookie_id, tokenData.access_token, expires_at);
-      account.access_token = tokenData.access_token;
+      try {
+        const tokenData = await oauthService.refreshAccessToken(account.refresh_token);
+        const expires_at = Date.now() + (tokenData.expires_in * 1000);
+        await accountService.updateAccountToken(cookie_id, tokenData.access_token, expires_at);
+        account.access_token = tokenData.access_token;
+      } catch (refreshError) {
+        // 如果是 invalid_grant 错误，直接禁用账号
+        if (refreshError.isInvalidGrant) {
+          logger.error(`账号刷新token失败(invalid_grant)，禁用账号: cookie_id=${cookie_id}`);
+          await accountService.updateAccountStatus(cookie_id, 0);
+        }
+        throw refreshError;
+      }
     }
 
     // 从API获取最新配额信息
@@ -681,9 +738,60 @@ router.get('/api/quotas/user', authenticateApiKey, async (req, res) => {
 /**
  * 获取共享池的聚合配额
  * GET /api/quotas/shared-pool
+ *
+ * 注意：此接口会自动检查并刷新配额已过期（reset_time 在当前时间之前）的账号，
+ * 确保返回的统计数据是最新的。
  */
 router.get('/api/quotas/shared-pool', authenticateApiKey, async (req, res) => {
   try {
+    // 首先检查是否有配额已过期的账号需要刷新
+    const expiredAccounts = await quotaService.getExpiredQuotaSharedAccounts();
+    
+    if (expiredAccounts.length > 0) {
+      logger.info(`发现 ${expiredAccounts.length} 个配额已过期的账号，正在刷新...`);
+      
+      // 并行刷新所有过期账号的配额
+      const refreshPromises = expiredAccounts.map(async (account) => {
+        try {
+          // 检查token是否过期，如果过期则刷新
+          let accessToken = account.access_token;
+          if (accountService.isTokenExpired(account)) {
+            logger.info(`账号token已过期，正在刷新: cookie_id=${account.cookie_id}`);
+            try {
+              const tokenData = await oauthService.refreshAccessToken(account.refresh_token);
+              const expires_at = Date.now() + (tokenData.expires_in * 1000);
+              await accountService.updateAccountToken(account.cookie_id, tokenData.access_token, expires_at);
+              accessToken = tokenData.access_token;
+            } catch (refreshError) {
+              // 如果是 invalid_grant 错误，直接禁用账号
+              if (refreshError.isInvalidGrant) {
+                logger.error(`账号刷新token失败(invalid_grant)，禁用账号: cookie_id=${account.cookie_id}`);
+                await accountService.updateAccountStatus(account.cookie_id, 0);
+              }
+              // 继续处理其他账号，不抛出错误
+              logger.warn(`刷新账号配额失败: cookie_id=${account.cookie_id}, error=${refreshError.message}`);
+              return;
+            }
+          }
+          
+          // 刷新配额
+          await multiAccountClient.refreshCookieQuota(account.cookie_id, accessToken);
+          logger.info(`已刷新账号配额: cookie_id=${account.cookie_id}`);
+        } catch (error) {
+          logger.warn(`刷新账号配额失败: cookie_id=${account.cookie_id}, error=${error.message}`);
+          // 如果是token刷新失败，标记账号需要重新授权
+          if (error.message.includes('refresh') || error.message.includes('token')) {
+            await accountService.markAccountNeedRefresh(account.cookie_id);
+          }
+        }
+      });
+      
+      // 等待所有刷新完成
+      await Promise.all(refreshPromises);
+      logger.info(`配额刷新完成`);
+    }
+    
+    // 获取更新后的配额统计
     const quotas = await quotaService.getSharedPoolQuotas();
 
     // earliest_reset_time 是本地时间,移除 Z 标志
@@ -751,11 +859,23 @@ router.get('/api/quotas/consumption/stats/:model_name', authenticateApiKey, asyn
 /**
  * 获取模型列表
  * GET /v1/models
+ * Header: X-Account-Type: antigravity (默认) 或 kiro
  */
 router.get('/v1/models', authenticateApiKey, async (req, res) => {
   try {
-    const models = await multiAccountClient.getAvailableModels(req.user.user_id);
-    res.json(models);
+    // 从请求头获取账号类型，默认为 antigravity
+    const accountType = (req.headers['x-account-type'] || 'antigravity').toLowerCase();
+    
+    if (accountType === 'kiro') {
+      // 使用 kiro 账号系统
+      const kiroClient = (await import('../api/kiro_client.js')).default;
+      const models = kiroClient.getAvailableModels();
+      res.json(models);
+    } else {
+      // 使用 antigravity 账号系统（默认）
+      const models = await multiAccountClient.getAvailableModels(req.user.user_id);
+      res.json(models);
+    }
   } catch (error) {
     logger.error('获取模型列表失败:', error.message);
     const statusCode = error.statusCode || 500;
@@ -767,143 +887,293 @@ router.get('/v1/models', authenticateApiKey, async (req, res) => {
  * 聊天补全
  * POST /v1/chat/completions
  * Body: { messages, model, stream, ... }
+ * Header: X-Account-Type: antigravity (默认) 或 kiro
  */
 router.post('/v1/chat/completions', authenticateApiKey, async (req, res) => {
-  const { messages, model, stream = true, tools, ...params } = req.body;
+  const { messages, model, stream = true, tools, tool_choice, ...params } = req.body;
 
   // 参数验证错误仍返回400
   if (!messages) {
     return res.status(400).json({ error: 'messages是必需的' });
   }
 
-  const requestBody = generateRequestBody(messages, model, params, tools);
+  // 从请求头获取账号类型，默认为 antigravity
+  const accountType = (req.headers['x-account-type'] || 'antigravity').toLowerCase();
+  
+  if (accountType === 'kiro') {
+    // 使用 kiro 账号系统
+    const kiroClient = (await import('../api/kiro_client.js')).default;
+    
+    if (!model) {
+      return res.status(400).json({ error: 'model是必需的' });
+    }
 
-  if (stream) {
-    // 流式响应始终返回200，错误通过流传递
-    res.setHeader('Content-Type', 'text/event-stream');
-    res.setHeader('Cache-Control', 'no-cache');
-    res.setHeader('Connection', 'keep-alive');
+    const options = { tools, tool_choice };
 
-    const id = `chatcmpl-${Date.now()}`;
-    const created = Math.floor(Date.now() / 1000);
-    let hasToolCall = false;
-    let collectedImages = [];
+    if (stream) {
+      // 流式响应
+      res.setHeader('Content-Type', 'text/event-stream');
+      res.setHeader('Cache-Control', 'no-cache');
+      res.setHeader('Connection', 'keep-alive');
 
-    try {
-      await multiAccountClient.generateResponse(requestBody, (data) => {
-        if (data.type === 'tool_calls') {
-          hasToolCall = true;
-          res.write(`data: ${JSON.stringify({
-            id,
-            object: 'chat.completion.chunk',
-            created,
-            model,
-            choices: [{ index: 0, delta: { tool_calls: data.tool_calls }, finish_reason: null }]
-          })}\n\n`);
-        } else if (data.type === 'image') {
-          // 收集图像数据,稍后一起返回
-          collectedImages.push(data.image);
-        } else {
-          res.write(`data: ${JSON.stringify({
-            id,
-            object: 'chat.completion.chunk',
-            created,
-            model,
-            choices: [{ index: 0, delta: { content: data.content }, finish_reason: null }]
-          })}\n\n`);
-        }
-      }, req.user.user_id, model, req.user);
+      const id = `chatcmpl-${Date.now()}`;
+      const created = Math.floor(Date.now() / 1000);
+      let hasToolCall = false;
 
-      // 如果有生成的图像,在结束前以base64格式返回
-      if (collectedImages.length > 0) {
-        for (const img of collectedImages) {
-          const imageUrl = `data:${img.mimeType};base64,${img.data}`;
-          res.write(`data: ${JSON.stringify({
-            id,
-            object: 'chat.completion.chunk',
-            created,
-            model,
-            choices: [{ index: 0, delta: { content: `\n![生成的图像](${imageUrl})\n` }, finish_reason: null }]
-          })}\n\n`);
-        }
+      try {
+        await kiroClient.generateResponse(messages, model, (data) => {
+          if (data.type === 'tool_calls') {
+            hasToolCall = true;
+            res.write(`data: ${JSON.stringify({
+              id,
+              object: 'chat.completion.chunk',
+              created,
+              model,
+              choices: [{ index: 0, delta: { tool_calls: data.tool_calls }, finish_reason: null }]
+            })}\n\n`);
+          } else {
+            res.write(`data: ${JSON.stringify({
+              id,
+              object: 'chat.completion.chunk',
+              created,
+              model,
+              choices: [{ index: 0, delta: { content: data.content }, finish_reason: null }]
+            })}\n\n`);
+          }
+        }, req.user.user_id, options);
+
+        res.write(`data: ${JSON.stringify({
+          id,
+          object: 'chat.completion.chunk',
+          created,
+          model,
+          choices: [{ index: 0, delta: {}, finish_reason: hasToolCall ? 'tool_calls' : 'stop' }]
+        })}\n\n`);
+        res.write('data: [DONE]\n\n');
+        res.end();
+      } catch (error) {
+        logger.error('Kiro生成响应失败:', error.message);
+        res.write(`data: ${JSON.stringify({
+          id,
+          object: 'chat.completion.chunk',
+          created,
+          model,
+          choices: [{ index: 0, delta: { content: `\n\n错误: ${error.message}` }, finish_reason: null }]
+        })}\n\n`);
+        res.write(`data: ${JSON.stringify({
+          id,
+          object: 'chat.completion.chunk',
+          created,
+          model,
+          choices: [{ index: 0, delta: {}, finish_reason: 'stop' }]
+        })}\n\n`);
+        res.write('data: [DONE]\n\n');
+        res.end();
       }
+    } else {
+      // 非流式响应
+      try {
+        let fullContent = '';
+        let toolCalls = [];
 
-      res.write(`data: ${JSON.stringify({
-        id,
-        object: 'chat.completion.chunk',
-        created,
-        model,
-        choices: [{ index: 0, delta: {}, finish_reason: hasToolCall ? 'tool_calls' : 'stop' }]
-      })}\n\n`);
-      res.write('data: [DONE]\n\n');
-      res.end();
-    } catch (error) {
-      // 流式错误处理：在流中发送错误信息
-      logger.error('生成响应失败:', error.message);
-      res.write(`data: ${JSON.stringify({
-        id,
-        object: 'chat.completion.chunk',
-        created,
-        model,
-        choices: [{ index: 0, delta: { content: `\n\n错误: ${error.message}` }, finish_reason: null }]
-      })}\n\n`);
-      res.write(`data: ${JSON.stringify({
-        id,
-        object: 'chat.completion.chunk',
-        created,
-        model,
-        choices: [{ index: 0, delta: {}, finish_reason: 'stop' }]
-      })}\n\n`);
-      res.write('data: [DONE]\n\n');
-      res.end();
+        await kiroClient.generateResponse(messages, model, (data) => {
+          if (data.type === 'tool_calls') {
+            toolCalls = data.tool_calls;
+          } else {
+            fullContent += data.content;
+          }
+        }, req.user.user_id, options);
+
+        const message = { role: 'assistant', content: fullContent };
+        if (toolCalls.length > 0) {
+          message.tool_calls = toolCalls;
+        }
+
+        res.json({
+          id: `chatcmpl-${Date.now()}`,
+          object: 'chat.completion',
+          created: Math.floor(Date.now() / 1000),
+          model,
+          choices: [{
+            index: 0,
+            message,
+            finish_reason: toolCalls.length > 0 ? 'tool_calls' : 'stop'
+          }]
+        });
+      } catch (error) {
+        logger.error('Kiro生成响应失败:', error.message);
+        res.status(500).json({ error: error.message });
+      }
     }
   } else {
-    // 非流式响应：正常错误处理
-    try {
-      let fullContent = '';
-      let toolCalls = [];
+    // 使用 antigravity 账号系统（默认）
+    const requestBody = generateRequestBody(messages, model, params, tools);
+
+    // 计算输入token数
+    const inputText = messages.map(m => {
+      if (typeof m.content === 'string') return m.content;
+      if (Array.isArray(m.content)) {
+        return m.content.filter(c => c.type === 'text').map(c => c.text).join('');
+      }
+      return '';
+    }).join('\n');
+    const promptTokens = countStringTokens(inputText, model);
+
+    if (stream) {
+      // 流式响应始终返回200，错误通过流传递
+      res.setHeader('Content-Type', 'text/event-stream');
+      res.setHeader('Cache-Control', 'no-cache');
+      res.setHeader('Connection', 'keep-alive');
+
+      const id = `chatcmpl-${Date.now()}`;
+      const created = Math.floor(Date.now() / 1000);
+      let hasToolCall = false;
       let collectedImages = [];
+      let fullContent = ''; // 累积输出内容用于计算token
+      let toolCallArgs = ''; // 累积工具调用参数用于计算token
 
-      await multiAccountClient.generateResponse(requestBody, (data) => {
-        if (data.type === 'tool_calls') {
-          toolCalls = data.tool_calls;
-        } else if (data.type === 'image') {
-          collectedImages.push(data.image);
-        } else {
-          fullContent += data.content;
+      try {
+        await multiAccountClient.generateResponse(requestBody, (data) => {
+          if (data.type === 'tool_calls') {
+            hasToolCall = true;
+            // 累积工具调用内容用于token计算
+            toolCallArgs += data.tool_calls.map(tc => tc.function?.name + (tc.function?.arguments || '')).join('');
+            res.write(`data: ${JSON.stringify({
+              id,
+              object: 'chat.completion.chunk',
+              created,
+              model,
+              choices: [{ index: 0, delta: { tool_calls: data.tool_calls }, finish_reason: null }]
+            })}\n\n`);
+          } else if (data.type === 'image') {
+            // 收集图像数据,稍后一起返回
+            collectedImages.push(data.image);
+          } else {
+            fullContent += data.content || ''; // 累积内容
+            res.write(`data: ${JSON.stringify({
+              id,
+              object: 'chat.completion.chunk',
+              created,
+              model,
+              choices: [{ index: 0, delta: { content: data.content }, finish_reason: null }]
+            })}\n\n`);
+          }
+        }, req.user.user_id, model, req.user);
+
+        // 如果有生成的图像,在结束前以base64格式返回
+        if (collectedImages.length > 0) {
+          for (const img of collectedImages) {
+            const imageUrl = `data:${img.mimeType};base64,${img.data}`;
+            const imageContent = `\n![生成的图像](${imageUrl})\n`;
+            fullContent += imageContent;
+            res.write(`data: ${JSON.stringify({
+              id,
+              object: 'chat.completion.chunk',
+              created,
+              model,
+              choices: [{ index: 0, delta: { content: imageContent }, finish_reason: null }]
+            })}\n\n`);
+          }
         }
-      }, req.user.user_id, model, req.user);
 
-      // 如果有生成的图像,将其添加到响应内容中
-      if (collectedImages.length > 0) {
-        fullContent += '\n\n';
-        for (const img of collectedImages) {
-          const imageUrl = `data:${img.mimeType};base64,${img.data}`;
-          fullContent += `![生成的图像](${imageUrl})\n`;
+        // 计算输出token数（包括文本内容和工具调用参数）
+        const completionTokens = countStringTokens(fullContent + toolCallArgs, model);
+        const totalTokens = promptTokens + completionTokens;
+
+        // 发送带usage的finish chunk
+        res.write(`data: ${JSON.stringify({
+          id,
+          object: 'chat.completion.chunk',
+          created,
+          model,
+          choices: [{ index: 0, delta: {}, finish_reason: hasToolCall ? 'tool_calls' : 'stop' }],
+          usage: {
+            prompt_tokens: promptTokens,
+            completion_tokens: completionTokens,
+            total_tokens: totalTokens
+          }
+        })}\n\n`);
+        res.write('data: [DONE]\n\n');
+        res.end();
+      } catch (error) {
+        // 流式错误处理：在流中发送错误信息
+        logger.error('生成响应失败:', error.message);
+        res.write(`data: ${JSON.stringify({
+          id,
+          object: 'chat.completion.chunk',
+          created,
+          model,
+          choices: [{ index: 0, delta: { content: `\n\n错误: ${error.message}` }, finish_reason: null }]
+        })}\n\n`);
+        res.write(`data: ${JSON.stringify({
+          id,
+          object: 'chat.completion.chunk',
+          created,
+          model,
+          choices: [{ index: 0, delta: {}, finish_reason: 'stop' }]
+        })}\n\n`);
+        res.write('data: [DONE]\n\n');
+        res.end();
+      }
+    } else {
+      // 非流式响应：正常错误处理
+      try {
+        let fullContent = '';
+        let toolCalls = [];
+        let collectedImages = [];
+        let toolCallArgs = ''; // 累积工具调用参数用于计算token
+
+        await multiAccountClient.generateResponse(requestBody, (data) => {
+          if (data.type === 'tool_calls') {
+            toolCalls = data.tool_calls;
+            toolCallArgs += data.tool_calls.map(tc => tc.function?.name + (tc.function?.arguments || '')).join('');
+          } else if (data.type === 'image') {
+            collectedImages.push(data.image);
+          } else {
+            fullContent += data.content || '';
+          }
+        }, req.user.user_id, model, req.user);
+
+        // 如果有生成的图像,将其添加到响应内容中
+        if (collectedImages.length > 0) {
+          fullContent += '\n\n';
+          for (const img of collectedImages) {
+            const imageUrl = `data:${img.mimeType};base64,${img.data}`;
+            fullContent += `![生成的图像](${imageUrl})\n`;
+          }
         }
-      }
 
-      const message = { role: 'assistant', content: fullContent };
-      if (toolCalls.length > 0) {
-        message.tool_calls = toolCalls;
-      }
+        // 计算输出token数（包括文本内容和工具调用参数）
+        const completionTokens = countStringTokens(fullContent + toolCallArgs, model);
+        const totalTokens = promptTokens + completionTokens;
 
-      res.json({
-        id: `chatcmpl-${Date.now()}`,
-        object: 'chat.completion',
-        created: Math.floor(Date.now() / 1000),
-        model,
-        choices: [{
-          index: 0,
-          message,
-          finish_reason: toolCalls.length > 0 ? 'tool_calls' : 'stop'
-        }]
-      });
-    } catch (error) {
-      logger.error('生成响应失败:', error.message);
-      const statusCode = error.statusCode || 500;
-      const errorMessage = error.responseText || error.message;
-      res.status(statusCode).json({ error: errorMessage });
+        const message = { role: 'assistant', content: fullContent };
+        if (toolCalls.length > 0) {
+          message.tool_calls = toolCalls;
+        }
+
+        res.json({
+          id: `chatcmpl-${Date.now()}`,
+          object: 'chat.completion',
+          created: Math.floor(Date.now() / 1000),
+          model,
+          choices: [{
+            index: 0,
+            message,
+            finish_reason: toolCalls.length > 0 ? 'tool_calls' : 'stop'
+          }],
+          usage: {
+            prompt_tokens: promptTokens,
+            completion_tokens: completionTokens,
+            total_tokens: totalTokens
+          }
+        });
+      } catch (error) {
+        logger.error('生成响应失败:', error.message);
+        const statusCode = error.statusCode || 500;
+        const errorMessage = error.responseText || error.message;
+        res.status(statusCode).json({ error: errorMessage });
+      }
     }
   }
 });

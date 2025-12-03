@@ -29,9 +29,10 @@ class MultiAccountClient {
    * @param {string} user_id - 用户ID
    * @param {string} model_name - 模型名称
    * @param {Object} user - 用户对象（包含prefer_shared）
+   * @param {Array} excludeCookieIds - 要排除的cookie_id列表（用于重试时排除已失败的账号）
    * @returns {Promise<Object>} 账号对象
    */
-  async getAvailableAccount(user_id, model_name, user) {
+  async getAvailableAccount(user_id, model_name, user, excludeCookieIds = []) {
     // 确保 prefer_shared 有明确的值（默认为0 - 专属优先）
     const preferShared = user?.prefer_shared ?? 0;
     let accounts = [];
@@ -59,6 +60,12 @@ class MultiAccountClient {
       logger.info(`专属优先模式 - 专属账号=${dedicatedAccounts.length}个, 共享账号=${sharedAccounts.length}个, 总计=${accounts.length}个`);
       logger.info(`专属账号列表: ${JSON.stringify(dedicatedAccounts.map(a => ({ cookie_id: a.cookie_id, is_shared: a.is_shared, user_id: a.user_id })))}`);
       logger.info(`共享账号列表: ${JSON.stringify(sharedAccounts.map(a => ({ cookie_id: a.cookie_id, is_shared: a.is_shared, user_id: a.user_id })))}`);
+    }
+
+    // 排除已经尝试失败的账号
+    if (excludeCookieIds.length > 0) {
+      accounts = accounts.filter(acc => !excludeCookieIds.includes(acc.cookie_id));
+      logger.info(`排除失败账号后剩余: ${accounts.length}个`);
     }
 
     if (accounts.length === 0) {
@@ -137,11 +144,27 @@ class MultiAccountClient {
     // 检查token是否过期，如果过期则刷新
     if (accountService.isTokenExpired(account)) {
       logger.info(`账号token已过期，正在刷新: cookie_id=${account.cookie_id}`);
-      const tokenData = await oauthService.refreshAccessToken(account.refresh_token);
-      const expires_at = Date.now() + (tokenData.expires_in * 1000);
-      await accountService.updateAccountToken(account.cookie_id, tokenData.access_token, expires_at);
-      account.access_token = tokenData.access_token;
-      account.expires_at = expires_at;
+      try {
+        const tokenData = await oauthService.refreshAccessToken(account.refresh_token);
+        const expires_at = Date.now() + (tokenData.expires_in * 1000);
+        await accountService.updateAccountToken(account.cookie_id, tokenData.access_token, expires_at);
+        account.access_token = tokenData.access_token;
+        account.expires_at = expires_at;
+      } catch (refreshError) {
+        // 如果是 invalid_grant 错误，直接禁用账号
+        if (refreshError.isInvalidGrant) {
+          logger.error(`账号刷新token失败(invalid_grant)，禁用账号: cookie_id=${account.cookie_id}`);
+          await accountService.updateAccountStatus(account.cookie_id, 0);
+        } else {
+          // 其他错误，标记需要重新授权
+          logger.error(`账号刷新token失败，标记需要重新授权: cookie_id=${account.cookie_id}, error=${refreshError.message}`);
+          await accountService.markAccountNeedRefresh(account.cookie_id);
+        }
+        
+        // 尝试获取下一个可用账号
+        const newExcludeList = [...excludeCookieIds, account.cookie_id];
+        return this.getAvailableAccount(user_id, model_name, user, newExcludeList);
+      }
     }
 
     return account;
@@ -160,42 +183,28 @@ class MultiAccountClient {
     // 判断是否为 Gemini 模型（不输出 <think> 标记）
     const isGeminiModel = model_name.startsWith('gemini-');
     
-    // 对话开始前实时获取quota，如果为0则重新选择cookie
+    // 使用缓存的配额信息，不阻塞请求
     let quotaBefore = null;
-    let retryCount = 0;
-    const maxRetries = 5;
-    
-    while (retryCount < maxRetries) {
-      try {
-        // 先更新该cookie的最新quota
-        await this.refreshCookieQuota(account.cookie_id, account.access_token);
-        
-        const quotaInfo = await quotaService.getQuota(account.cookie_id, model_name);
-        quotaBefore = quotaInfo ? parseFloat(quotaInfo.quota) : null;
-        
-        // 如果quota为0，轮换cookie
-        if (quotaBefore !== null && quotaBefore <= 0) {
-          logger.warn(`Cookie配额已耗尽，轮换cookie: cookie_id=${account.cookie_id}, quota=${quotaBefore}`);
-          retryCount++;
-          if (retryCount < maxRetries) {
-            // 重新获取可用账号（随机选择会选到不同的cookie）
-            const newAccount = await this.getAvailableAccount(user_id, model_name, user);
-            Object.assign(account, newAccount);
-            continue;
-          } else {
-            throw new Error(`已尝试${maxRetries}次，所有cookie的配额都已耗尽`);
-          }
+    try {
+      const quotaInfo = await quotaService.getQuota(account.cookie_id, model_name);
+      quotaBefore = quotaInfo ? parseFloat(quotaInfo.quota) : null;
+      
+      // 检查缓存是否过期（超过5分钟），如果过期则在后台异步刷新
+      if (quotaInfo?.last_fetched_at) {
+        const cacheAge = Date.now() - new Date(quotaInfo.last_fetched_at).getTime();
+        const CACHE_TTL = 5 * 60 * 1000; // 5分钟
+        if (cacheAge > CACHE_TTL) {
+          logger.info(`配额缓存已过期(${Math.round(cacheAge/1000)}秒)，后台异步刷新`);
+          // 异步刷新，不阻塞请求
+          this.refreshCookieQuota(account.cookie_id, account.access_token).catch(err => {
+            logger.warn('后台刷新配额失败:', err.message);
+          });
         }
-        
-        logger.info(`对话开始 - cookie_id=${account.cookie_id}, model=${model_name}, quota_before=${quotaBefore}, 尝试次数=${retryCount + 1}`);
-        break;
-      } catch (error) {
-        if (retryCount >= maxRetries - 1) {
-          throw error;
-        }
-        logger.warn('获取对话前quota失败，重试:', error.message);
-        retryCount++;
       }
+      
+      logger.info(`对话开始 - cookie_id=${account.cookie_id}, model=${model_name}, quota_before=${quotaBefore} (缓存值)`);
+    } catch (error) {
+      logger.warn('获取缓存配额失败:', error.message);
     }
     
     const url = config.api.url;
@@ -337,6 +346,14 @@ class MultiAccountClient {
       
       // 记录配额消耗（所有cookie都记录）
       if (quotaBefore !== null && quotaAfter !== null) {
+        let consumed = parseFloat(quotaBefore) - parseFloat(quotaAfter);
+        
+        // 如果消耗为负数，说明配额在请求期间重置了，记录消耗为0
+        if (consumed < 0) {
+          logger.info(`配额在请求期间重置，记录消耗为0 - quota_before=${quotaBefore}, quota_after=${quotaAfter}`);
+          consumed = 0;
+        }
+        
         await quotaService.recordQuotaConsumption(
           user_id,
           account.cookie_id,
@@ -345,7 +362,6 @@ class MultiAccountClient {
           quotaAfter,
           account.is_shared
         );
-        const consumed = parseFloat(quotaBefore) - parseFloat(quotaAfter);
         logger.info(`配额消耗已记录 - user_id=${user_id}, is_shared=${account.is_shared}, consumed=${consumed.toFixed(4)}`);
       } else {
         logger.warn(`无法记录配额消耗 - quotaBefore=${quotaBefore}, quotaAfter=${quotaAfter}`);
@@ -373,10 +389,19 @@ class MultiAccountClient {
 
     // 检查token是否过期
     if (accountService.isTokenExpired(account)) {
-      const tokenData = await oauthService.refreshAccessToken(account.refresh_token);
-      const expires_at = Date.now() + (tokenData.expires_in * 1000);
-      await accountService.updateAccountToken(account.cookie_id, tokenData.access_token, expires_at);
-      account.access_token = tokenData.access_token;
+      try {
+        const tokenData = await oauthService.refreshAccessToken(account.refresh_token);
+        const expires_at = Date.now() + (tokenData.expires_in * 1000);
+        await accountService.updateAccountToken(account.cookie_id, tokenData.access_token, expires_at);
+        account.access_token = tokenData.access_token;
+      } catch (refreshError) {
+        // 如果是 invalid_grant 错误，直接禁用账号
+        if (refreshError.isInvalidGrant) {
+          logger.error(`账号刷新token失败(invalid_grant)，禁用账号: cookie_id=${account.cookie_id}`);
+          await accountService.updateAccountStatus(account.cookie_id, 0);
+        }
+        throw refreshError;
+      }
     }
 
     const modelsUrl = config.api.modelsUrl;
