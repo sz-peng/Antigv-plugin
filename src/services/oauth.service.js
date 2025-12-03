@@ -416,10 +416,11 @@ class OAuthService {
     // 第一步：获取project_id并检查账号资格
     let project_id_0 = '';
     let is_restricted = false;
-    let ineligible = null;
+    let ineligible = false;
+    let projectData = null;
     
     try {
-      const projectData = await projectService.loadCodeAssist(tokenData.access_token);
+      projectData = await projectService.loadCodeAssist(tokenData.access_token);
       
       // 检查是否为 INELIGIBLE_ACCOUNT
       if (projectData.ineligibleTiers && projectData.ineligibleTiers.length > 0) {
@@ -444,34 +445,29 @@ class OAuthService {
         }
       }
       
-      // 检查是否有cloudaicompanionProject
-      if (!projectData.cloudaicompanionProject) {
-        // 检查paidTier是否为free（paidTier是对象而非数组）
-        const hasFree = projectData.paidTier &&
-                       (projectData.paidTier.id === 'free' ||
-                        projectData.paidTier.id === 'free-tier');
-        
-        if (hasFree) {
-          // 如果有free tier，则阻止登录
-          let reason = 'UNKNOWN_ERROR';
-          if (projectData.ineligibleTiers && projectData.ineligibleTiers.length > 0) {
-            // 如果有ineligibleTiers，使用第一个reasonCode
-            reason = projectData.ineligibleTiers[0].reasonCode || 'UNKNOWN_ERROR';
-          }
-          
-          ineligible = reason;
-          logger.error(`账号缺少cloudaicompanionProject且有free tier: cookie_id=${cookie_id}, reason=${reason}`);
-          this.stateMap.delete(state);
-          throw new Error(`此账号没有资格使用Antigravity: ${reason}`);
-        } else {
-          // 没有free tier，允许登录但project_id_0为空
-          logger.info(`账号缺少cloudaicompanionProject但无free tier，允许登录: cookie_id=${cookie_id}`);
-        }
+      // 获取project_id_0
+      if (!is_restricted && projectData.cloudaicompanionProject) {
+        project_id_0 = projectData.cloudaicompanionProject;
       }
       
-      // 获取project_id_0
-      if (!is_restricted) {
-        project_id_0 = projectData.cloudaicompanionProject;
+      // 判断是否为付费用户：paidTier.id 不包含 'free' 字符串则为付费用户
+      // 如果没有paidTier，默认为false（免费用户）
+      let paid_tier = false;
+      if (projectData.paidTier?.id) {
+        paid_tier = !projectData.paidTier.id.toLowerCase().includes('free');
+      }
+      
+      // 检查是否允许登录：project_id_0为空 且 paid_tier为false 时阻止登录
+      if (!project_id_0 && !paid_tier) {
+        let reason = 'NO_PROJECT_AND_FREE_TIER';
+        if (projectData.ineligibleTiers && projectData.ineligibleTiers.length > 0) {
+          reason = projectData.ineligibleTiers[0].reasonCode || reason;
+        }
+        
+        ineligible = true;
+        logger.error(`账号不符合使用条件 (project_id_0为空且为免费用户): cookie_id=${cookie_id}, reason=${reason}`);
+        this.stateMap.delete(state);
+        throw new Error(`此账号没有资格使用Antigravity: ${reason}`);
       }
       
     } catch (error) {
@@ -517,12 +513,7 @@ class OAuthService {
     
     logger.info(`配额获取完成: cookie_id=${cookie_id}, 共${Object.keys(mergedModels).length}个模型`);
 
-    // 判断是否为付费用户：paidTier.id 不包含 'free' 字符串则为付费用户
-    let paid_tier = null;
-    if (projectData.paidTier?.id) {
-      paid_tier = !projectData.paidTier.id.toLowerCase().includes('free');
-    }
-
+    // paid_tier 已在前面计算，这里直接使用
     // 第三步：创建账号
     const account = await accountService.createAccount({
       cookie_id,

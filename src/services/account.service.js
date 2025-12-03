@@ -25,7 +25,7 @@ class AccountService {
       is_restricted = false,
       ineligible = false,
       name = null,
-      paid_tier = null
+      paid_tier = false
     } = accountData;
 
     try {
@@ -268,10 +268,10 @@ class AccountService {
    * @param {string} project_id_0 - Google Cloud项目ID
    * @param {boolean} is_restricted - 是否受地区限制
    * @param {boolean} ineligible - 是否不合格（INELIGIBLE_ACCOUNT）
-   * @param {boolean|null} paid_tier - 是否付费用户（true=付费, false=免费, null=未知）
+   * @param {boolean} paid_tier - 是否付费用户（true=付费, false=免费）
    * @returns {Promise<Object>} 更新后的账号信息
    */
-  async updateProjectIds(cookie_id, project_id_0, is_restricted, ineligible = false, paid_tier = null) {
+  async updateProjectIds(cookie_id, project_id_0, is_restricted, ineligible = false, paid_tier = false) {
     try {
       const result = await database.query(
         `UPDATE accounts

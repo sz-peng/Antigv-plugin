@@ -82,7 +82,8 @@ class ProjectService {
       const project_id_0 = apiResponse.cloudaicompanionProject || '';
       
       // 判断是否为付费用户：paidTier.id 不包含 'free' 字符串则为付费用户
-      let paid_tier = null;
+      // 如果没有paidTier，默认为false（免费用户）
+      let paid_tier = false;
       if (apiResponse.paidTier?.id) {
         paid_tier = !apiResponse.paidTier.id.toLowerCase().includes('free');
       }
