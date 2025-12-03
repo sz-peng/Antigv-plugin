@@ -132,7 +132,9 @@ function handleAssistantMessage(message, antigravityMessages, isImageModel = fal
         // 非 image 模型的正常处理逻辑
         // 提取并处理 <think>...</think> 标签内容
         const thinkMatches = textContent.match(/<think>([\s\S]*?)<\/think>/g);
-        if (thinkMatches) {
+        const hasThinkingContent = thinkMatches && thinkMatches.length > 0;
+        
+        if (hasThinkingContent) {
           for (const match of thinkMatches) {
             const thinkContent = match.replace(/<\/?think>/g, '').trim();
             if (thinkContent) {
@@ -148,12 +150,23 @@ function handleAssistantMessage(message, antigravityMessages, isImageModel = fal
         textContent = textContent.replace(/\n{3,}/g, '\n\n').trim();
         
         if (textContent) {
-          // 在thinking模式下，如果已经有thinking block，需要明确标记非thinking内容
-          if (enableThinking && parts.length > 0) {
-            parts.push({ text: textContent, thought: false });
+          // 在thinking模式下的处理逻辑
+          if (enableThinking) {
+            // 如果已经有thinking block，需要明确标记非thinking内容
+            if (hasThinkingContent) {
+              parts.push({ text: textContent, thought: false });
+            } else {
+              // 如果没有thinking内容但启用了thinking模式（从非thinking模型切换过来的历史消息）
+              // 需要将整个内容标记为thought: false，确保最后一条助手消息有thought标记
+              parts.push({ text: textContent, thought: false });
+            }
           } else {
             parts.push({ text: textContent });
           }
+        } else if (enableThinking && !hasThinkingContent && parts.length === 0) {
+          // 如果启用thinking但没有任何内容，添加一个空的thought: false标记
+          // 这确保了即使是空消息也符合thinking模式的要求
+          parts.push({ text: "", thought: false });
         }
       }
     }
