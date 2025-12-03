@@ -129,25 +129,8 @@ class OAuthService {
         }
       };
       
-      logger.info(`[${requestId}] 发送HTTPS请求:`, {
-        hostname: options.hostname,
-        path: options.path,
-        method: options.method,
-        headers: {
-          'Content-Type': options.headers['Content-Type'],
-          'Content-Length': options.headers['Content-Length']
-        },
-        body_size: Buffer.byteLength(data)
-      });
-      
       const req = https.request(options, (res) => {
         const responseStartTime = Date.now();
-        logger.info(`[${requestId}] 收到响应:`, {
-          status_code: res.statusCode,
-          status_message: res.statusMessage,
-          headers: res.headers,
-          http_version: res.httpVersion
-        });
         
         let body = '';
         let chunkCount = 0;
@@ -163,23 +146,9 @@ class OAuthService {
           const totalTime = Date.now() - startTime;
           const responseTime = Date.now() - responseStartTime;
           
-          logger.info(`[${requestId}] 响应接收完成:`, {
-            total_chunks: chunkCount,
-            total_bytes: totalBytes,
-            response_time_ms: responseTime,
-            total_time_ms: totalTime
-          });
-          
           if (res.statusCode === 200) {
             try {
               const tokenData = JSON.parse(body);
-              logger.info(`[${requestId}] Token交换成功:`, {
-                access_token_length: tokenData.access_token ? tokenData.access_token.length : 0,
-                refresh_token_length: tokenData.refresh_token ? tokenData.refresh_token.length : 0,
-                expires_in: tokenData.expires_in,
-                token_type: tokenData.token_type,
-                scope: tokenData.scope
-              });
               resolve(tokenData);
             } catch (parseError) {
               logger.error(`[${requestId}] JSON解析失败:`, parseError.message);
@@ -261,17 +230,6 @@ class OAuthService {
           'Content-Length': Buffer.byteLength(data)
         }
       };
-      
-      logger.info(`[${requestId}] 发送HTTPS请求:`, {
-        hostname: options.hostname,
-        path: options.path,
-        method: options.method,
-        headers: {
-          'Content-Type': options.headers['Content-Type'],
-          'Content-Length': options.headers['Content-Length']
-        },
-        body_size: Buffer.byteLength(data)
-      });
 
       const req = https.request(options, (res) => {
         const responseStartTime = Date.now();
@@ -293,13 +251,6 @@ class OAuthService {
           if (res.statusCode === 200) {
             try {
               const tokenData = JSON.parse(body);
-              logger.info(`[${requestId}] Token刷新成功:`, {
-                access_token_length: tokenData.access_token ? tokenData.access_token.length : 0,
-                expires_in: tokenData.expires_in,
-                token_type: tokenData.token_type,
-                scope: tokenData.scope,
-                has_refresh_token: !!tokenData.refresh_token
-              });
               resolve(tokenData);
             } catch (parseError) {
               logger.error(`[${requestId}] JSON解析失败:`, parseError.message);
@@ -465,6 +416,7 @@ class OAuthService {
     // 第一步：获取project_id并检查账号资格
     let project_id_0 = '';
     let is_restricted = false;
+    let ineligible = null;
     
     try {
       const projectData = await projectService.loadCodeAssist(tokenData.access_token);
@@ -478,7 +430,7 @@ class OAuthService {
         if (hasIneligibleAccount) {
           logger.error(`账号不符合使用条件 (INELIGIBLE_ACCOUNT): cookie_id=${cookie_id}`);
           this.stateMap.delete(state);
-          throw new Error('此账号没有资格使用Antigravity，请更换账号重试');
+          throw new Error('此账号没有资格使用Antigravity: INELIGIBLE_ACCOUNT');
         }
         
         // 检查是否为 UNSUPPORTED_LOCATION
@@ -492,18 +444,35 @@ class OAuthService {
         }
       }
       
+      // 检查是否有cloudaicompanionProject
+      if (!projectData.cloudaicompanionProject) {
+        // 确定失败原因
+        let reason = 'UNKNOWN_ERROR';
+        if (projectData.ineligibleTiers && projectData.ineligibleTiers.length > 0) {
+          // 如果有ineligibleTiers，使用第一个reasonCode
+          reason = projectData.ineligibleTiers[0].reasonCode || 'UNKNOWN_ERROR';
+        }
+        
+        ineligible = reason;
+        logger.error(`账号缺少cloudaicompanionProject: cookie_id=${cookie_id}, reason=${reason}`);
+        this.stateMap.delete(state);
+        throw new Error(`此账号没有资格使用Antigravity: ${reason}`);
+      }
+      
       // 获取project_id_0
-      if (!is_restricted && projectData.cloudaicompanionProject) {
+      if (!is_restricted) {
         project_id_0 = projectData.cloudaicompanionProject;
       }
       
     } catch (error) {
-      // 如果是 INELIGIBLE_ACCOUNT 错误，直接抛出
-      if (error.message.includes('INELIGIBLE_ACCOUNT') || error.message.includes('请更换账号重试')) {
+      // 如果是已知的账号资格错误，直接抛出
+      if (error.message.includes('原因:')) {
         throw error;
       }
-      // 其他错误不阻止登录
-      logger.warn(`project_id获取失败，但允许继续登录: cookie_id=${cookie_id}, error=${error.message}`);
+      // 其他未知错误也阻止登录
+      logger.error(`project_id获取失败: cookie_id=${cookie_id}, error=${error.message}`);
+      this.stateMap.delete(state);
+      throw new Error('此账号没有资格使用Antigravity: UNKNOWN_ERROR');
     }
 
     let mergedModels = {};
@@ -548,6 +517,7 @@ class OAuthService {
       expires_at,
       project_id_0,
       is_restricted,
+      ineligible,
       name: accountName
     });
 

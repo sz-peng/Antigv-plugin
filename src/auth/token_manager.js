@@ -137,7 +137,6 @@ class TokenManager {
       if (currentToken && currentToken.access_token === currentAccessToken) {
         try {
           await this.refreshToken(currentToken);
-          log.info('Token刷新成功，返回新token');
           return currentToken;
         } catch (refreshError) {
           if (refreshError.statusCode === 403) {

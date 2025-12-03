@@ -40,7 +40,6 @@ class MultiAccountClient {
     
     logger.info(`========== 开始获取可用账号 ==========`);
     logger.info(`用户信息 - user_id=${user_id}, prefer_shared=${preferShared} (原始值: ${user?.prefer_shared}), model=${model_name}`);
-    logger.info(`用户对象完整信息: ${JSON.stringify(user)}`);
     
     // 根据用户优先级选择cookie
     if (preferShared === 1) {
@@ -50,8 +49,6 @@ class MultiAccountClient {
       const dedicatedAccounts = await accountService.getAvailableAccounts(user_id, 0);
       accounts = sharedAccounts.concat(dedicatedAccounts);
       logger.info(`共享优先模式 - 共享账号=${sharedAccounts.length}个, 专属账号=${dedicatedAccounts.length}个, 总计=${accounts.length}个`);
-      logger.info(`共享账号列表: ${JSON.stringify(sharedAccounts.map(a => ({ cookie_id: a.cookie_id, is_shared: a.is_shared, user_id: a.user_id })))}`);
-      logger.info(`专属账号列表: ${JSON.stringify(dedicatedAccounts.map(a => ({ cookie_id: a.cookie_id, is_shared: a.is_shared, user_id: a.user_id })))}`);
     } else {
       // 专属优先：先尝试专属cookie，再尝试共享cookie
       logger.info(`执行专属优先策略...`);
@@ -59,8 +56,6 @@ class MultiAccountClient {
       const sharedAccounts = await accountService.getAvailableAccounts(null, 1);
       accounts = dedicatedAccounts.concat(sharedAccounts);
       logger.info(`专属优先模式 - 专属账号=${dedicatedAccounts.length}个, 共享账号=${sharedAccounts.length}个, 总计=${accounts.length}个`);
-      logger.info(`专属账号列表: ${JSON.stringify(dedicatedAccounts.map(a => ({ cookie_id: a.cookie_id, is_shared: a.is_shared, user_id: a.user_id })))}`);
-      logger.info(`共享账号列表: ${JSON.stringify(sharedAccounts.map(a => ({ cookie_id: a.cookie_id, is_shared: a.is_shared, user_id: a.user_id })))}`);
     }
 
     // 排除已经尝试失败的账号
@@ -89,13 +84,11 @@ class MultiAccountClient {
             const userQuota = await quotaService.getUserModelSharedQuotaPool(user_id, sharedModel);
             if (userQuota && userQuota.quota > 0) {
               hasQuota = true;
-              logger.info(`用户共享配额可用: user_id=${user_id}, model=${model_name}, shared_model=${sharedModel}, quota=${userQuota.quota}`);
               break;
             }
           }
           
           if (!hasQuota) {
-            logger.warn(`用户共享配额不足: user_id=${user_id}, model=${model_name}, checked_models=${sharedModels.join(', ')}`);
             continue; // 跳过此共享cookie
           }
         }
@@ -138,7 +131,6 @@ class MultiAccountClient {
     const account = selectedPool[randomIndex];
     
     logger.info(`========== 最终选择账号 ==========`);
-    logger.info(`从${poolType}的${selectedPool.length}个账号中随机选择第${randomIndex}个`);
     logger.info(`选中账号: cookie_id=${account.cookie_id}, is_shared=${account.is_shared}, user_id=${account.user_id}`);
     logger.info(`所有配额可用账号: ${JSON.stringify(availableAccounts.map(a => ({ cookie_id: a.cookie_id, is_shared: a.is_shared, user_id: a.user_id })))}`);
 
