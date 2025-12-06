@@ -808,7 +808,7 @@ router.post('/v1/kiro/chat/completions', authenticateApiKey, async (req, res) =>
           // OpenAI 流式格式：首次发送工具调用（包含 id, type, function.name）
           hasToolCall = true;
           const toolCalls = data.tool_calls.map((tc, idx) => ({
-            index: toolCallIndex + idx,
+            index: tc.index,  // 使用从 kiro_client 传来的正确索引
             id: tc.id,
             type: 'function',
             function: {
@@ -840,7 +840,8 @@ router.post('/v1/kiro/chat/completions', authenticateApiKey, async (req, res) =>
               index: 0,
               delta: {
                 tool_calls: [{
-                  index: data.tool_call_index,
+                  index: data.tool_call_index,  // 使用正确的工具调用索引
+                  id: data.tool_call_id,  // 添加工具调用ID
                   function: {
                     arguments: data.delta
                   }
@@ -948,27 +949,30 @@ router.post('/v1/kiro/chat/completions', authenticateApiKey, async (req, res) =>
       let fullContent = '';
       let toolCalls = [];
       let toolCallArgs = ''; // 累积工具调用参数用于token计算
-      let currentToolCall = null; // 跟踪当前正在构建的工具调用
+      const toolCallsMap = new Map(); // 使用 Map 来跟踪多个工具调用
 
       await kiroClient.generateResponse(messages, model, (data) => {
         if (data.type === 'tool_call_start') {
           // 开始新的工具调用
-          currentToolCall = {
-            id: data.tool_calls[0].id,
+          const toolCall = data.tool_calls[0];
+          toolCallsMap.set(toolCall.id, {
+            id: toolCall.id,
             type: 'function',
             function: {
-              name: data.tool_calls[0].function.name,
+              name: toolCall.function.name,
               arguments: ''
             }
-          };
-          toolCallArgs += data.tool_calls[0].function.name;
+          });
+          toolCallArgs += toolCall.function.name;
         } else if (data.type === 'tool_call_delta') {
-          // 累积工具调用参数
-          if (currentToolCall) {
-            currentToolCall.function.arguments += data.delta || '';
+          // 累积工具调用参数到对应的工具调用
+          const toolCall = toolCallsMap.get(data.tool_call_id);
+          if (toolCall) {
+            toolCall.function.arguments += data.delta || '';
             toolCallArgs += data.delta || '';
           }
         } else if (data.type === 'tool_calls') {
+          // 兼容旧格式
           toolCalls = data.tool_calls;
           toolCallArgs += data.tool_calls.map(tc => tc.function?.name + (tc.function?.arguments || '')).join('');
         } else if (data.type === 'text') {
@@ -976,9 +980,9 @@ router.post('/v1/kiro/chat/completions', authenticateApiKey, async (req, res) =>
         }
       }, req.user.user_id, options);
 
-      // 如果有正在构建的工具调用，添加到列表
-      if (currentToolCall) {
-        toolCalls.push(currentToolCall);
+      // 将 Map 中的工具调用转换为数组
+      if (toolCallsMap.size > 0) {
+        toolCalls = Array.from(toolCallsMap.values());
       }
 
       // 计算输出token数（包括文本内容和工具调用参数）

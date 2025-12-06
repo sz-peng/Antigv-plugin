@@ -152,6 +152,10 @@ class KiroClient {
   async handleStreamResponse(response, callback, requestId, contextInfo) {
     let buffer = Buffer.alloc(0);
     let messageCount = 0;
+    // 跟踪工具调用：toolUseId -> index 的映射
+    const toolCallIndexMap = new Map();
+    // 使用对象包装计数器，这样可以在函数间共享引用
+    const indexCounter = { value: 0 };
 
     return new Promise((resolve, reject) => {
       response.on('data', (chunk) => {
@@ -177,7 +181,7 @@ class KiroClient {
             const message = this.parseSingleMessage(messageData);
             if (message) {
               messageCount++;
-              this.processMessage(message, callback, requestId, contextInfo);
+              this.processMessage(message, callback, requestId, contextInfo, toolCallIndexMap, indexCounter);
             }
           } catch (error) {
             logger.warn(`[${requestId}] 消息解析失败:`, error.message);
@@ -239,8 +243,10 @@ class KiroClient {
    * @param {Function} callback - 回调函数
    * @param {string} requestId - 请求ID
    * @param {Object} contextInfo - 上下文信息（user_id, account_id, model_id, is_shared）
+   * @param {Map} toolCallIndexMap - 工具调用ID到索引的映射
+   * @param {Object} indexCounter - 索引计数器对象 { value: number }
    */
-  processMessage(message, callback, requestId, contextInfo) {
+  processMessage(message, callback, requestId, contextInfo, toolCallIndexMap, indexCounter) {
     // 处理文本内容
     if (message.content) {
       callback({ type: 'text', content: message.content });
@@ -250,8 +256,19 @@ class KiroClient {
     if (message.name && message.toolUseId) {
       // Anthropic 格式: { name: "WebSearch", toolUseId: "xxx", input: {...} }
       // 转换为 OpenAI 流式格式
+      
+      // 获取或分配工具调用索引
+      let toolCallIndex;
+      if (toolCallIndexMap.has(message.toolUseId)) {
+        toolCallIndex = toolCallIndexMap.get(message.toolUseId);
+      } else {
+        toolCallIndex = indexCounter.value;
+        toolCallIndexMap.set(message.toolUseId, toolCallIndex);
+        indexCounter.value++; // 递增计数器
+      }
+      
       const toolCall = {
-        index: 0,
+        index: toolCallIndex,
         id: message.toolUseId,
         type: 'function',
         function: {
@@ -264,11 +281,18 @@ class KiroClient {
 
     // 处理工具调用的参数（流式传输）
     if (message.input && message.toolUseId) {
+      // 获取工具调用索引
+      const toolCallIndex = toolCallIndexMap.get(message.toolUseId);
+      if (toolCallIndex === undefined) {
+        logger.warn(`[${requestId}] 收到未知工具调用的input: toolUseId=${message.toolUseId}`);
+        return;
+      }
+      
       // 将 input 对象转换为 JSON 字符串，模拟流式传输
       const args = typeof message.input === 'string' ? message.input : JSON.stringify(message.input);
       callback({
         type: 'tool_call_delta',
-        tool_call_index: 0,
+        tool_call_index: toolCallIndex,
         tool_call_id: message.toolUseId,
         delta: args
       });
