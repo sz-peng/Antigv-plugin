@@ -388,18 +388,24 @@ class KiroClient {
         account.machineid
       );
 
-      // 4. 更新数据库中的余额信息
+      // 4. 更新数据库中的余额信息（包含免费试用和bonus信息）
       await kiroAccountService.updateAccountUsage(contextInfo.account_id, {
         email: usageLimitsData.email,
         userid: usageLimitsData.userid,
         subscription: usageLimitsData.subscription,
         current_usage: usageLimitsData.current_usage,
         reset_date: usageLimitsData.reset_date,
+        usage_limit: usageLimitsData.usage_limit,
+        // 免费试用信息（free_trial_status 现在是字符串：ACTIVE/EXPIRED/null）
         free_trial_status: usageLimitsData.free_trial_status,
         free_trial_usage: usageLimitsData.free_trial_usage,
         free_trial_expiry: usageLimitsData.free_trial_expiry,
         free_trial_limit: usageLimitsData.free_trial_limit,
-        usage_limit: usageLimitsData.usage_limit
+        // bonus信息
+        bonus_usage: usageLimitsData.bonus_usage,
+        bonus_limit: usageLimitsData.bonus_limit,
+        bonus_available: usageLimitsData.bonus_available,
+        bonus_details: usageLimitsData.bonus_details
       });
 
       logger.info(`[${requestId}] 余额已更新: account_id=${contextInfo.account_id}, current_usage=${usageLimitsData.current_usage}`);

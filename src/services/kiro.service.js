@@ -897,9 +897,9 @@ class KiroService {
   async getUsageLimits(accessToken, profileArn, machineid) {
     const requestId = crypto.randomUUID().substring(0, 8);
     logger.info(`[${requestId}] 开始获取Kiro使用量信息`);
-
     return new Promise((resolve, reject) => {
       const params = new URLSearchParams({
+        isEmailRequired: true,
         origin: 'AI_EDITOR',
         profileArn: profileArn,
         resourceType: 'AGENTIC_REQUEST'
@@ -963,13 +963,20 @@ class KiroService {
       email: data.userInfo?.email || null,
       userid: data.userInfo?.userId || null,
       subscription: data.subscriptionInfo?.subscriptionTitle || 'unknown',
+      subscription_type: data.subscriptionInfo?.type || null,
       reset_date: data.nextDateReset ? new Date(data.nextDateReset * 1000).toISOString() : null,
       current_usage: 0,
       usage_limit: 0,
-      free_trial_status: false,
+      // 免费试用相关字段
+      free_trial_status: false, // 是否激活（布尔值）
       free_trial_usage: null,
       free_trial_expiry: null,
-      free_trial_limit: 0
+      free_trial_limit: 0,
+      // bonus相关字段（只包含bonuses数组中的bonus，不包含免费试用）
+      bonus_usage: 0,
+      bonus_limit: 0,
+      bonus_available: 0,
+      bonus_details: []
     };
 
     // 查找CREDIT类型的使用量
@@ -978,8 +985,9 @@ class KiroService {
         result.current_usage = breakdown.currentUsageWithPrecision || breakdown.currentUsage || 0;
         result.usage_limit = breakdown.usageLimitWithPrecision || breakdown.usageLimit || 0;
 
-        // 处理免费试用信息
+        // 处理免费试用信息（无论状态如何都返回数据）
         if (breakdown.freeTrialInfo) {
+          // 是否激活（布尔值）
           result.free_trial_status = breakdown.freeTrialInfo.freeTrialStatus === 'ACTIVE';
           result.free_trial_usage = breakdown.freeTrialInfo.currentUsageWithPrecision ||
                                      breakdown.freeTrialInfo.currentUsage || 0;
@@ -990,6 +998,46 @@ class KiroService {
             result.free_trial_expiry = new Date(breakdown.freeTrialInfo.freeTrialExpiry * 1000).toISOString();
           }
         }
+
+        let totalBonusUsage = 0;
+        let totalBonusLimit = 0;
+        const bonusDetails = [];
+
+        // 处理bonuses数组（不包含免费试用，免费试用是单独的freeTrialInfo）
+        if (breakdown.bonuses && Array.isArray(breakdown.bonuses)) {
+          for (const bonus of breakdown.bonuses) {
+            if (bonus.status === 'ACTIVE') {
+              const bonusUsage = bonus.currentUsage || 0;
+              const bonusLimit = bonus.usageLimit || 0;
+              
+              totalBonusUsage += bonusUsage;
+              totalBonusLimit += bonusLimit;
+              
+              bonusDetails.push({
+                type: 'bonus',
+                name: bonus.displayName || bonus.bonusCode,
+                code: bonus.bonusCode,
+                description: bonus.description,
+                usage: bonusUsage,
+                limit: bonusLimit,
+                available: Math.max(0, bonusLimit - bonusUsage),
+                status: bonus.status,
+                expires_at: bonus.expiresAt
+                  ? new Date(bonus.expiresAt * 1000).toISOString()
+                  : null,
+                redeemed_at: bonus.redeemedAt
+                  ? new Date(bonus.redeemedAt * 1000).toISOString()
+                  : null
+              });
+            }
+          }
+        }
+
+        result.bonus_usage = totalBonusUsage;
+        result.bonus_limit = totalBonusLimit;
+        result.bonus_available = Math.max(0, totalBonusLimit - totalBonusUsage);
+        result.bonus_details = bonusDetails;
+        
         break;
       }
     }
@@ -1005,11 +1053,8 @@ class KiroService {
   calculateAvailableCount(usageLimits) {
     let totalAvailable = 0;
 
-    // 添加免费试用额度
-    if (usageLimits.free_trial_status && usageLimits.free_trial_limit) {
-      const freeTrialAvailable = usageLimits.free_trial_limit - (usageLimits.free_trial_usage || 0);
-      totalAvailable += freeTrialAvailable;
-    }
+    // 添加bonus额度（包含免费试用和bonus）
+    totalAvailable += usageLimits.bonus_available || 0;
 
     // 添加基础额度
     const baseAvailable = usageLimits.usage_limit - usageLimits.current_usage;

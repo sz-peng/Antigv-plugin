@@ -189,9 +189,11 @@ router.post('/api/kiro/oauth/callback', async (req, res) => {
     }
 
     // 创建账号（使用Redis中存储的user_id）
+    // 如果有email则使用email作为account_name，否则使用默认名称
+    const accountName = usageLimitsData.email || `Kiro ${stateInfo.provider}账号`;
     const account = await kiroAccountService.createAccount({
       user_id: userId,
-      account_name: `Kiro ${stateInfo.provider}账号`,
+      account_name: accountName,
       auth_method: 'Social',
       refresh_token: tokenData.refresh_token,
       access_token: tokenData.access_token,
@@ -204,11 +206,17 @@ router.post('/api/kiro/oauth/callback', async (req, res) => {
       subscription: usageLimitsData.subscription || 'unknown',
       current_usage: usageLimitsData.current_usage || 0,
       reset_date: usageLimitsData.reset_date || new Date().toISOString(),
-      free_trial_status: usageLimitsData.free_trial_status || false,
-      free_trial_usage: usageLimitsData.free_trial_usage,
-      free_trial_expiry: usageLimitsData.free_trial_expiry,
+      usage_limit: usageLimitsData.usage_limit || 0,
+      // 免费试用信息
+      free_trial_status: usageLimitsData.free_trial_status || null,
+      free_trial_usage: usageLimitsData.free_trial_usage || null,
+      free_trial_expiry: usageLimitsData.free_trial_expiry || null,
       free_trial_limit: usageLimitsData.free_trial_limit || 0,
-      usage_limit: usageLimitsData.usage_limit || 0
+      // bonus信息
+      bonus_usage: usageLimitsData.bonus_usage || 0,
+      bonus_limit: usageLimitsData.bonus_limit || 0,
+      bonus_available: usageLimitsData.bonus_available || 0,
+      bonus_details: usageLimitsData.bonus_details || []
     });
 
     // 准备安全的账号数据
@@ -260,15 +268,14 @@ router.post('/api/kiro/oauth/callback', async (req, res) => {
 /**
  * 创建Kiro账号（手动方式，需要提供refresh_token）
  * POST /api/kiro/accounts
- * Body: { account_name, auth_method, refresh_token, client_id?, client_secret?, machineid, is_shared, email?, userid, subscription, current_usage, reset_date, free_trial_status, free_trial_usage?, free_trial_expiry?, free_trial_limit, usage_limit }
+ * Body: { account_name, auth_method, refresh_token, client_id?, client_secret?, machineid, is_shared, email?, userid, subscription, current_usage, reset_date, usage_limit }
  */
 router.post('/api/kiro/accounts', authenticateApiKey, async (req, res) => {
   try {
     const {
       account_name, auth_method, refresh_token, client_id, client_secret,
       machineid, is_shared, email, userid,
-      subscription, current_usage, reset_date, free_trial_status,
-      free_trial_usage, free_trial_expiry, free_trial_limit, usage_limit
+      subscription, current_usage, reset_date, usage_limit
     } = req.body;
 
     if (!auth_method || !refresh_token) {
@@ -282,10 +289,6 @@ router.post('/api/kiro/accounts', authenticateApiKey, async (req, res) => {
 
     if (is_shared !== 0 && is_shared !== 1) {
       return res.status(400).json({ error: 'is_shared必须是0或1' });
-    }
-
-    if (free_trial_status !== undefined && typeof free_trial_status !== 'boolean') {
-      return res.status(400).json({ error: 'free_trial_status必须是boolean类型' });
     }
 
     if (!['Social', 'IdC'].includes(auth_method)) {
@@ -323,10 +326,6 @@ router.post('/api/kiro/accounts', authenticateApiKey, async (req, res) => {
     const finalSubscription = subscription || usageLimitsData.subscription || 'unknown';
     const finalCurrentUsage = current_usage !== undefined ? current_usage : (usageLimitsData.current_usage || 0);
     const finalResetDate = reset_date || usageLimitsData.reset_date || new Date().toISOString();
-    const finalFreeTrialStatus = free_trial_status !== undefined ? free_trial_status : (usageLimitsData.free_trial_status || false);
-    const finalFreeTrialUsage = free_trial_usage !== undefined ? free_trial_usage : usageLimitsData.free_trial_usage;
-    const finalFreeTrialExpiry = free_trial_expiry || usageLimitsData.free_trial_expiry;
-    const finalFreeTrialLimit = free_trial_limit !== undefined ? free_trial_limit : (usageLimitsData.free_trial_limit || 0);
     const finalUsageLimit = usage_limit !== undefined ? usage_limit : (usageLimitsData.usage_limit || 0);
 
     // 创建账号
@@ -347,11 +346,11 @@ router.post('/api/kiro/accounts', authenticateApiKey, async (req, res) => {
       subscription: finalSubscription,
       current_usage: finalCurrentUsage,
       reset_date: finalResetDate,
-      free_trial_status: finalFreeTrialStatus,
-      free_trial_usage: finalFreeTrialUsage,
-      free_trial_expiry: finalFreeTrialExpiry,
-      free_trial_limit: finalFreeTrialLimit,
-      usage_limit: finalUsageLimit
+      usage_limit: finalUsageLimit,
+      bonus_usage: usageLimitsData.bonus_usage || 0,
+      bonus_limit: usageLimitsData.bonus_limit || 0,
+      bonus_available: usageLimitsData.bonus_available || 0,
+      bonus_details: usageLimitsData.bonus_details || []
     });
 
     // 隐藏敏感信息
@@ -582,11 +581,17 @@ router.get('/api/kiro/accounts/:account_id/balance', authenticateApiKey, async (
       subscription: usageLimitsData.subscription,
       current_usage: usageLimitsData.current_usage,
       reset_date: usageLimitsData.reset_date,
+      usage_limit: usageLimitsData.usage_limit,
+      // 免费试用信息
       free_trial_status: usageLimitsData.free_trial_status,
       free_trial_usage: usageLimitsData.free_trial_usage,
       free_trial_expiry: usageLimitsData.free_trial_expiry,
       free_trial_limit: usageLimitsData.free_trial_limit,
-      usage_limit: usageLimitsData.usage_limit
+      // bonus信息
+      bonus_usage: usageLimitsData.bonus_usage,
+      bonus_limit: usageLimitsData.bonus_limit,
+      bonus_available: usageLimitsData.bonus_available,
+      bonus_details: usageLimitsData.bonus_details
     });
 
     // 计算可用额度
@@ -599,20 +604,24 @@ router.get('/api/kiro/accounts/:account_id/balance', authenticateApiKey, async (
         account_name: account.account_name,
         email: account.email,
         subscription: account.subscription,
+        subscription_type: usageLimitsData.subscription_type,
         balance: {
           available: balance.available,
           total_limit: balance.total_limit,
           current_usage: balance.current_usage,
-          is_trial: balance.is_trial,
-          reset_date: balance.reset_date,
-          free_trial_expiry: balance.free_trial_expiry
+          base_available: balance.base_available,
+          bonus_available: balance.bonus_available,
+          reset_date: balance.reset_date
         },
-        raw_data: {
-          usage_limit: account.usage_limit,
-          free_trial_limit: account.free_trial_limit,
-          current_usage: account.current_usage,
-          free_trial_usage: account.free_trial_usage
-        }
+        // 免费试用信息
+        free_trial: {
+          status: balance.free_trial_status,
+          usage: balance.free_trial_usage,
+          limit: balance.free_trial_limit,
+          available: balance.free_trial_available,
+          expiry: balance.free_trial_expiry
+        },
+        bonus_details: balance.bonus_details
       }
     });
   } catch (error) {
