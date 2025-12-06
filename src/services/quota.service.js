@@ -11,8 +11,8 @@ class QuotaService {
       // Gemini 3 pro 系列共享配额
       'gemini-3-pro': ['gemini-3-pro-low', 'gemini-3-pro-high'],
       
-      // Claude 4.5 系列共享配额
-      'claude-sonnet-4-5': ['claude-sonnet-4-5', 'claude-sonnet-4-5-thinking'],
+      // Claude 系列共享配额
+      'claude': ['claude-sonnet-4-5', 'claude-sonnet-4-5-thinking', 'claude-opus-4-5-thinking'],
       
       // Gemini 2.5 pro 系列共享配额
       'gemini-2.5-pro': ['gemini-2.5-pro', 'gemini-2.5-pro-thinking'],
@@ -22,6 +22,7 @@ class QuotaService {
       'claude-gpt-oss': [
         'claude-sonnet-4-5',
         'claude-sonnet-4-5-thinking',
+        'claude-opus-4-5-thinking',
         'gpt-oss-120b-medium'
       ],
     };
