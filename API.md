@@ -17,6 +17,7 @@
   - [账号管理](#账号管理)
   - [配额管理](#配额管理)
   - [OpenAI 兼容接口](#openai-兼容接口)
+  - [图片生成接口](#图片生成接口)
 
 ---
 
@@ -738,6 +739,72 @@ Authorization: Bearer {用户API Key}
   ]
 }
 ```
+
+
+### 3. 图片生成
+
+**请求**
+
+```http
+POST /v1beta/models/{model}:generateContent
+Authorization: Bearer {用户API Key}
+Content-Type: application/json
+
+{
+  "contents": [
+    {
+      "role": "user",
+      "parts": [
+        {
+          "text": "生成一只可爱的猫"
+        }
+      ]
+    }
+  ],
+  "generationConfig": {
+    "imageConfig": {
+      "aspectRatio": "1:1",
+      "imageSize": "1K"
+    }
+  }
+}
+```
+
+**参数说明**
+
+- `model` (必需): 模型名称，例如 `gemini-2.5-flash-image` 或 `gemini-2.5-pro-image`
+- `contents` (必需): 包含提示词的消息数组
+- `generationConfig.imageConfig` (可选): 图片生成配置
+  - `aspectRatio`: 宽高比。支持的宽高比：`1:1`、`2:3`、`3:2`、`3:4`、`4:3`、`9:16`、`16:9`、`21:9`。如果未指定，模型将根据提供的任何参考图片选择默认宽高比。
+  - `imageSize`: 图片尺寸。支持的值为 `1K`、`2K`、`4K`。如果未指定，模型将使用默认值 `1K`。
+
+**响应**
+
+```json
+{
+  "candidates": [
+    {
+      "content": {
+        "parts": [
+          {
+            "inlineData": {
+              "mimeType": "image/jpeg",
+              "data": "/9j/4AAQSkZJRgABAQAAAQABAAD/2wBDA..."
+            }
+          }
+        ],
+        "role": "model"
+      },
+      "finishReason": "STOP"
+    }
+  ]
+}
+```
+
+**字段说明**
+
+- `candidates[0].content.parts[0].inlineData.data`: Base64 编码的图片数据
+- `candidates[0].content.parts[0].inlineData.mimeType`: 图片 MIME 类型，例如 `image/jpeg`
 
 ---
 

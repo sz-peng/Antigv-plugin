@@ -271,7 +271,7 @@ class MultiAccountClient {
     let toolCalls = [];
     let generatedImages = [];
     let buffer = ''; // 用于处理跨chunk的JSON
-    let collectedSignature = null; // 🔥 简化：只收集第一个 signature
+    let collectedSignature = null; // 只收集第一个 signature
     let hasToolCalls = false; // 标记是否有 tool calls
     let collectedParts = []; // 收集所有原始 parts 用于日志打印
     let fullTextContent = ''; // 累积完整的文本内容

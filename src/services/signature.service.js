@@ -4,7 +4,7 @@ import logger from '../utils/logger.js';
 /**
  * Thought Signature 管理服务
  *
- * 简化版：只存储单个 signature 字符串
+ * 只存储单个 signature 字符串
  *
  * Gemini 的要求：
  * 1. 最后一条 model 消息必须有 thought: true

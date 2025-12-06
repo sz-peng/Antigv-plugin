@@ -95,7 +95,7 @@ function handleAssistantMessage(message, antigravityMessages, isImageModel = fal
       argsObj = {};
     }
     
-    // 🔥 关键修复：Gemini API 要求 functionCall parts 包含 thoughtSignature
+    // 修复：Gemini API 要求 functionCall parts 包含 thoughtSignature
     // 注意：thoughtSignature 是 part 对象的属性，与 functionCall 同级，而不是 functionCall 内部的属性
     // 正确格式：{ thoughtSignature: "...", functionCall: { name, args } }
     // 错误格式：{ functionCall: { name, args, thoughtSignature: "..." } }
@@ -116,7 +116,7 @@ function handleAssistantMessage(message, antigravityMessages, isImageModel = fal
   }) : [];
   
   if (lastMessage?.role === "model" && hasToolCalls && !hasContent){
-    // 🔥 关键修复：在合并 tool_calls 到现有 model 消息时，
+    // 修复：在合并 tool_calls 到现有 model 消息时，
     // 如果启用 thinking 且有 signature，需要确保消息开头有思考块
     if (enableThinking && signature && !lastMessage.parts.some(p => p.thought === true)) {
       // 在开头插入一个带 signature 的思考块（使用占位符内容）
@@ -170,7 +170,7 @@ function handleAssistantMessage(message, antigravityMessages, isImageModel = fal
           }
         }
         
-        // 🔥 关键修复：如果启用 thinking 但没有思考内容，需要添加一个带 signature 的思考块
+        // 修复：如果启用 thinking 但没有思考内容，需要添加一个带 signature 的思考块
         // Claude API 要求：当 thinking 启用时，所有 assistant 消息都必须以 thinking 块开头
         // 这包括：1) 有 tool_calls 的消息  2) 纯文本消息（没有 tool_calls）
         // 注意：使用占位符内容而不是空字符串，因为空字符串可能导致 Antigravity 转换问题
@@ -201,7 +201,7 @@ function handleAssistantMessage(message, antigravityMessages, isImageModel = fal
         }
       }
     } else if (enableThinking && hasToolCalls && signature) {
-      // 🔥 关键修复：如果没有内容但有 tool_calls，需要添加思考块（使用占位符内容）
+      // 修复：如果没有内容但有 tool_calls，需要添加思考块（使用占位符内容）
       parts.push({
         text: "...",
         thought: true,
@@ -589,9 +589,24 @@ function generateImageRequestBody(prompt, modelName, imageConfig = {}, account =
   if (imageConfig && Object.keys(imageConfig).length > 0) {
     requestBody.request.generationConfig.imageConfig = {};
     if (imageConfig.aspect_ratio) {
+      // 校验 aspectRatio 参数
+      const validAspectRatios = ['1:1', '2:3', '3:2', '3:4', '4:3', '9:16', '16:9', '21:9'];
+      if (!validAspectRatios.includes(imageConfig.aspect_ratio)) {
+        const error = new Error(`Invalid aspectRatio: ${imageConfig.aspect_ratio}. Supported values: ${validAspectRatios.join(', ')}`);
+        error.statusCode = 400;
+        throw error;
+      }
       requestBody.request.generationConfig.imageConfig.aspectRatio = imageConfig.aspect_ratio;
     }
     if (imageConfig.image_size) {
+      // 校验 imageSize 参数
+      const validImageSizes = ['1K', '2K', '4K'];
+      if (!validImageSizes.includes(imageConfig.image_size)) {
+        const error = new Error(`Invalid imageSize: ${imageConfig.image_size}. Supported values: ${validImageSizes.join(', ')}`);
+        error.statusCode = 400;
+        throw error;
+      }
+
       if (modelName === 'gemini-2.5-flash-image') {
         const error = new Error('Unsupported parameter: imageSize for gemini-2.5-flash-image');
         error.statusCode = 400;
