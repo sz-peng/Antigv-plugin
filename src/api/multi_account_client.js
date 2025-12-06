@@ -223,10 +223,6 @@ class MultiAccountClient {
     
     let response;
     
-    // 打印发送给 Antigravity 上游的请求体
-    logger.info('========== Antigravity 上游请求体 ==========');
-    logger.info(JSON.stringify(requestBody, null, 2));
-    
     try {
       // 创建 AbortController 用于超时控制
       const controller = new AbortController();
@@ -327,7 +323,7 @@ class MultiAccountClient {
               collectedParts.push(partCopy);
             }
             
-            // 🔥 简化：只提取第一个 signature
+            // 只提取第一个 signature
             if (!collectedSignature) {
               const sig = signatureService.extractSignatureFromResponse(parts);
               if (sig) {
@@ -388,22 +384,7 @@ class MultiAccountClient {
       }
     }
 
-    // 打印 Antigravity 上游的完整响应（合并成 Gemini 格式）
-    logger.info('========== Antigravity 上游响应 (合并后) ==========');
-    const mergedResponse = {
-      response: {
-        candidates: [{
-          content: {
-            parts: collectedParts
-          },
-          finishReason: lastFinishReason
-        }]
-      }
-    };
-    logger.info(JSON.stringify(mergedResponse, null, 2));
-
-    // 🔥 简化：只有当有 tool calls 时才存储 signature
-    // 因为只有 tool 交互场景才需要 signature 来延续推理链
+    // 只有当有 tool calls 时才存储 signature
     if (collectedSignature && hasToolCalls && user_id) {
       try {
         await signatureService.storeSignature(user_id, collectedSignature);

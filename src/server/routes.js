@@ -920,10 +920,6 @@ router.post('/v1/chat/completions', authenticateApiKey, async (req, res) => {
 
   const { messages, model, stream = true, tools, tool_choice, image_config, ...params } = req.body;
   
-  // 打印用户传入的原始请求体
-  logger.info('========== 用户请求体 (Chat Completion) ==========');
-  logger.info(JSON.stringify(req.body, null, 2));
-  
   // 如果提供了 image_config，将其添加到 params 中
   if (image_config) {
     params.image_config = image_config;
