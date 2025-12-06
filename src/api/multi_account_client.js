@@ -271,7 +271,11 @@ class MultiAccountClient {
     let toolCalls = [];
     let generatedImages = [];
     let buffer = ''; // 用于处理跨chunk的JSON
-    let collectedSignatures = []; // 收集响应中的 thought signatures
+    let collectedSignature = null; // 🔥 简化：只收集第一个 signature
+    let hasToolCalls = false; // 标记是否有 tool calls
+    let collectedParts = []; // 收集所有原始 parts 用于日志打印
+    let fullTextContent = ''; // 累积完整的文本内容
+    let lastFinishReason = null; // 记录最后的 finishReason
 
     let chunkCount = 0;
     while (true) {
@@ -300,11 +304,32 @@ class MultiAccountClient {
           
           const parts = data.response?.candidates?.[0]?.content?.parts;
           
+          // 记录 finishReason
+          if (data.response?.candidates?.[0]?.finishReason) {
+            lastFinishReason = data.response.candidates[0].finishReason;
+          }
+          
           if (parts) {
-            // 提取 thought signatures
-            const signatures = signatureService.extractSignaturesFromResponse(parts);
-            if (signatures.length > 0) {
-              collectedSignatures.push(...signatures);
+            // 收集原始 parts 用于日志（深拷贝以保留原始数据）
+            for (const part of parts) {
+              // 深拷贝 part，但对于 inlineData 只保留元信息
+              const partCopy = { ...part };
+              if (partCopy.inlineData) {
+                partCopy.inlineData = {
+                  mimeType: partCopy.inlineData.mimeType,
+                  dataLength: partCopy.inlineData.data?.length || 0
+                };
+              }
+              collectedParts.push(partCopy);
+            }
+            
+            // 只提取第一个 signature
+            if (!collectedSignature) {
+              const sig = signatureService.extractSignatureFromResponse(parts);
+              if (sig) {
+                collectedSignature = sig;
+                logger.info(`提取到 thought signature: ${sig.substring(0, 20)}...`);
+              }
             }
             
             for (const part of parts) {
@@ -318,6 +343,7 @@ class MultiAccountClient {
                 if (part.text.trim() === '') {
                   continue;
                 }
+                fullTextContent += part.text; // 累积文本内容
                 callback({ type: 'text', content: part.text });
               } else if (part.inlineData) {
                 // 处理生成的图像
@@ -333,6 +359,7 @@ class MultiAccountClient {
                   }
                 });
               } else if (part.functionCall) {
+                hasToolCalls = true;
                 toolCalls.push({
                   id: part.functionCall.id,
                   type: 'function',
@@ -357,12 +384,12 @@ class MultiAccountClient {
       }
     }
 
-    // 存储收集到的 thought signatures
-    if (collectedSignatures.length > 0 && originalMessages.length > 0) {
+    // 只有当有 tool calls 时才存储 signature
+    if (collectedSignature && hasToolCalls && user_id) {
       try {
-        await signatureService.storeSignatures(user_id, originalMessages, collectedSignatures);
+        await signatureService.storeSignature(user_id, collectedSignature);
       } catch (error) {
-        logger.error('存储 thought signatures 失败:', error.message);
+        logger.error('存储 thought signature 失败:', error.message);
       }
     }
 
@@ -627,8 +654,42 @@ class MultiAccountClient {
       throw error;
     }
 
-    // 解析响应
-    const data = await response.json();
+    // 解析响应 (处理 SSE 流式格式)
+    const responseText = await response.text();
+    const lines = responseText.split('\n');
+    let collectedParts = [];
+    let lastFinishReason = null;
+
+    for (const line of lines) {
+      if (line.startsWith('data: ')) {
+        const jsonStr = line.slice(6);
+        try {
+          const chunk = JSON.parse(jsonStr);
+          const parts = chunk.response?.candidates?.[0]?.content?.parts;
+          if (parts) {
+            collectedParts.push(...parts);
+          }
+          if (chunk.response?.candidates?.[0]?.finishReason) {
+            lastFinishReason = chunk.response.candidates[0].finishReason;
+          }
+        } catch (e) {
+          logger.warn(`图片生成响应解析失败: ${e.message}`);
+        }
+      }
+    }
+
+    // 构造标准的 Gemini 响应格式
+    const data = {
+      candidates: [
+        {
+          content: {
+            parts: collectedParts,
+            role: 'model'
+          },
+          finishReason: lastFinishReason || 'STOP'
+        }
+      ]
+    };
     
     // 图片生成完成后，更新配额信息
     try {

@@ -914,6 +914,10 @@ router.get('/v1/models', authenticateApiKey, async (req, res) => {
  * Header: X-Account-Type: antigravity (默认) 或 kiro
  */
 router.post('/v1/chat/completions', authenticateApiKey, async (req, res) => {
+  // 设置10分钟超时（避免长对话被断开）
+  req.setTimeout(600000); // 10分钟 = 600000毫秒
+  res.setTimeout(600000);
+
   const { messages, model, stream = true, tools, tool_choice, image_config, ...params } = req.body;
   
   // 如果提供了 image_config，将其添加到 params 中
