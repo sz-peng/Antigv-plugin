@@ -573,6 +573,29 @@ router.delete('/api/accounts/:cookie_id', authenticateApiKey, async (req, res) =
       return res.status(403).json({ error: '无权删除此账号' });
     }
 
+    // 如果是共享账号，需要移除用户共享配额池中的配额
+    if (existingAccount.is_shared === 1) {
+      logger.info(`删除共享账号，正在移除用户共享配额: cookie_id=${cookie_id}, user_id=${existingAccount.user_id}`);
+      
+      // 获取该账号的配额信息
+      const accountQuotas = await quotaService.getQuotasByCookieId(cookie_id);
+      
+      // 移除每个模型的配额
+      for (const quota of accountQuotas) {
+        try {
+          await quotaService.removeUserSharedQuota(
+            existingAccount.user_id,
+            quota.model_name,
+            quota.quota  // 使用账号的实际配额值
+          );
+          logger.info(`已移除共享配额: user_id=${existingAccount.user_id}, model=${quota.model_name}, quota=${quota.quota}`);
+        } catch (quotaError) {
+          logger.error(`移除共享配额失败: model=${quota.model_name}, error=${quotaError.message}`);
+          // 继续处理其他模型，不中断删除流程
+        }
+      }
+    }
+
     await accountService.deleteAccount(cookie_id);
 
     res.json({
@@ -581,6 +604,98 @@ router.delete('/api/accounts/:cookie_id', authenticateApiKey, async (req, res) =
     });
   } catch (error) {
     logger.error('删除账号失败:', error.message);
+    res.status(500).json({ error: error.message });
+  }
+});
+
+/**
+ * 转换账号类型（专属/共享）
+ * PUT /api/accounts/:cookie_id/type
+ * Body: { is_shared }
+ *
+ * 专属账号(is_shared=0) → 共享账号(is_shared=1)：增加用户共享配额
+ * 共享账号(is_shared=1) → 专属账号(is_shared=0)：减少用户共享配额
+ */
+router.put('/api/accounts/:cookie_id/type', authenticateApiKey, async (req, res) => {
+  try {
+    const { cookie_id } = req.params;
+    const { is_shared } = req.body;
+
+    if (is_shared !== 0 && is_shared !== 1) {
+      return res.status(400).json({ error: 'is_shared必须是0或1' });
+    }
+
+    // 检查权限
+    const existingAccount = await accountService.getAccountByCookieId(cookie_id);
+    if (!existingAccount) {
+      return res.status(404).json({ error: '账号不存在' });
+    }
+    if (!req.isAdmin && existingAccount.user_id !== req.user.user_id) {
+      return res.status(403).json({ error: '无权修改此账号' });
+    }
+
+    // 如果类型没有变化，直接返回
+    if (existingAccount.is_shared === is_shared) {
+      return res.json({
+        success: true,
+        message: '账号类型未变化',
+        data: {
+          cookie_id: existingAccount.cookie_id,
+          is_shared: existingAccount.is_shared
+        }
+      });
+    }
+
+    // 获取该账号的配额信息
+    const accountQuotas = await quotaService.getQuotasByCookieId(cookie_id);
+
+    if (is_shared === 1) {
+      // 专属账号 → 共享账号：增加用户共享配额
+      logger.info(`账号类型转换: 专属→共享, cookie_id=${cookie_id}, user_id=${existingAccount.user_id}`);
+      
+      for (const quota of accountQuotas) {
+        try {
+          await quotaService.addUserSharedQuota(
+            existingAccount.user_id,
+            quota.model_name,
+            quota.quota
+          );
+          logger.info(`已增加共享配额: user_id=${existingAccount.user_id}, model=${quota.model_name}, quota=${quota.quota}`);
+        } catch (quotaError) {
+          logger.error(`增加共享配额失败: model=${quota.model_name}, error=${quotaError.message}`);
+        }
+      }
+    } else {
+      // 共享账号 → 专属账号：减少用户共享配额
+      logger.info(`账号类型转换: 共享→专属, cookie_id=${cookie_id}, user_id=${existingAccount.user_id}`);
+      
+      for (const quota of accountQuotas) {
+        try {
+          await quotaService.removeUserSharedQuota(
+            existingAccount.user_id,
+            quota.model_name,
+            quota.quota
+          );
+          logger.info(`已移除共享配额: user_id=${existingAccount.user_id}, model=${quota.model_name}, quota=${quota.quota}`);
+        } catch (quotaError) {
+          logger.error(`移除共享配额失败: model=${quota.model_name}, error=${quotaError.message}`);
+        }
+      }
+    }
+
+    // 更新账号类型
+    const updatedAccount = await accountService.updateAccountSharedType(cookie_id, is_shared);
+
+    res.json({
+      success: true,
+      message: `账号类型已更新为${is_shared === 1 ? '共享' : '专属'}`,
+      data: {
+        cookie_id: updatedAccount.cookie_id,
+        is_shared: updatedAccount.is_shared
+      }
+    });
+  } catch (error) {
+    logger.error('转换账号类型失败:', error.message);
     res.status(500).json({ error: error.message });
   }
 });
@@ -824,9 +939,20 @@ router.get('/api/quotas/shared-pool', authenticateApiKey, async (req, res) => {
       earliest_reset_time: q.earliest_reset_time ? q.earliest_reset_time.replace('Z', '') : q.earliest_reset_time
     }));
 
+    // 获取用户的所有配额消费总计（包括共享和专属）
+    const userConsumption = await quotaService.getUserTotalConsumption(req.user.user_id);
+
     res.json({
       success: true,
-      data: formattedQuotas
+      data: {
+        quotas: formattedQuotas,
+        user_consumption: {
+          total_requests: parseInt(userConsumption.total_requests) || 0,
+          total_quota_consumed: parseFloat(userConsumption.total_quota_consumed) || 0,
+          shared_quota_consumed: parseFloat(userConsumption.shared_quota_consumed) || 0,
+          private_quota_consumed: parseFloat(userConsumption.private_quota_consumed) || 0
+        }
+      }
     });
   } catch (error) {
     logger.error('获取共享池配额失败:', error.message);

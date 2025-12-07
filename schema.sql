@@ -85,18 +85,14 @@ BEGIN
   -- 计算新的上限：2 * n
   v_new_max := 2.0 * v_cookie_count;
   
-  -- 更新配额池上限，并将quota设置为上限（如果当前quota小于上限）
-  UPDATE user_shared_quota_pool
-  SET max_quota = v_new_max,
-      quota = GREATEST(quota, v_new_max),
-      last_updated_at = CURRENT_TIMESTAMP
-  WHERE user_id::TEXT = p_user_id::TEXT AND model_name = p_model_name;
-  
-  -- 如果记录不存在，创建新记录并初始化quota为max_quota
-  IF NOT FOUND THEN
-    INSERT INTO user_shared_quota_pool (user_id, model_name, quota, max_quota)
-    VALUES (p_user_id::UUID, p_model_name, v_new_max, v_new_max);
-  END IF;
+  -- 更新或插入配额池记录
+  -- 只更新 max_quota，不更新 quota
+  INSERT INTO user_shared_quota_pool (user_id, model_name, quota, max_quota)
+  VALUES (p_user_id::UUID, p_model_name, v_new_max, v_new_max)
+  ON CONFLICT (user_id, model_name)
+  DO UPDATE SET
+    max_quota = v_new_max,
+    last_updated_at = CURRENT_TIMESTAMP;
 END;
 $$;
 

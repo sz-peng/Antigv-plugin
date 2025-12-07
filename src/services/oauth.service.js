@@ -481,32 +481,35 @@ class OAuthService {
 
     let mergedModels = {};
     
-    // 使用project_id_0获取配额
-    if (project_id_0) {
-      try {
-        const response0 = await fetch(config.api.modelsUrl, {
-          method: 'POST',
-          headers: {
-            'Host': config.api.host,
-            'User-Agent': config.api.userAgent,
-            'Authorization': `Bearer ${tokenData.access_token}`,
-            'Content-Type': 'application/json',
-            'Accept-Encoding': 'gzip'
-          },
-          body: JSON.stringify({ project: project_id_0 })
-        });
+    // 使用project_id_0获取配额（即使为空也尝试，因为付费用户可能没有project_id但仍有配额）
+    try {
+      const projectIdToUse = project_id_0 || '';
+      logger.info(`正在获取配额: project_id=${projectIdToUse || '(空)'}`);
+      
+      const response0 = await fetch(config.api.modelsUrl, {
+        method: 'POST',
+        headers: {
+          'Host': config.api.host,
+          'User-Agent': config.api.userAgent,
+          'Authorization': `Bearer ${tokenData.access_token}`,
+          'Content-Type': 'application/json',
+          'Accept-Encoding': 'gzip'
+        },
+        body: JSON.stringify({ project: projectIdToUse })
+      });
 
-        if (response0.ok) {
-          const data0 = await response0.json();
-          if (data0.models) {
-            mergedModels = { ...data0.models };
-          }
-        } else {
-          logger.warn(`project_id_0配额获取失败: status=${response0.status}`);
+      if (response0.ok) {
+        const data0 = await response0.json();
+        if (data0.models) {
+          mergedModels = { ...data0.models };
+          logger.info(`配额获取成功: ${Object.keys(mergedModels).length}个模型`);
         }
-      } catch (error) {
-        logger.warn(`project_id_0配额获取异常: ${error.message}`);
+      } else {
+        const responseText = await response0.text();
+        logger.warn(`配额获取失败: status=${response0.status}, response=${responseText}`);
       }
+    } catch (error) {
+      logger.warn(`配额获取异常: ${error.message}`);
     }
     
     logger.info(`配额获取完成: cookie_id=${cookie_id}, 共${Object.keys(mergedModels).length}个模型`);
@@ -532,11 +535,28 @@ class OAuthService {
     
     const modelNames = Object.keys(mergedModels);
     
-    // 如果是共享cookie，更新用户共享配额池上限（2*n）
+    // 如果是共享cookie，增加用户共享配额池
+    // quota += 账号配额 * 2，max_quota += 2
     if (is_shared === 1) {
+      logger.info(`开始更新用户共享配额池: user_id=${user_id}, is_shared=${is_shared}, modelNames=${modelNames.length}`);
       for (const modelName of modelNames) {
-        await quotaService.updateUserSharedQuotaMax(user_id, modelName);
+        // 获取该模型的配额值
+        const modelInfo = mergedModels[modelName];
+        const accountQuota = modelInfo?.quotaInfo?.remainingFraction ?? 1.0;
+        
+        logger.info(`准备增加共享配额: user_id=${user_id}, model=${modelName}, accountQuota=${accountQuota}`);
+        
+        // 增加用户共享配额
+        try {
+          const result = await quotaService.addUserSharedQuota(user_id, modelName, accountQuota);
+          logger.info(`共享配额增加成功: user_id=${user_id}, model=${modelName}, quota=${result?.quota}, max_quota=${result?.max_quota}`);
+        } catch (error) {
+          logger.error(`共享配额增加失败: user_id=${user_id}, model=${modelName}, error=${error.message}`);
+        }
       }
+      logger.info(`用户共享配额池已更新: user_id=${user_id}, 更新了${modelNames.length}个模型`);
+    } else {
+      logger.info(`非共享账号，跳过更新用户共享配额池: user_id=${user_id}, is_shared=${is_shared}`);
     }
 
     // 清除state映射

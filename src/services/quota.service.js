@@ -295,6 +295,7 @@ class QuotaService {
 
   /**
    * 更新用户共享配额池上限（当用户添加/删除共享cookie时调用）
+   * 注意：此方法只更新 max_quota，不更新 quota
    * @param {string} user_id - 用户ID
    * @param {string} model_name - 模型名称
    * @returns {Promise<Object>} 更新后的配额池信息
@@ -315,6 +316,74 @@ class QuotaService {
       return result.rows[0];
     } catch (error) {
       logger.error('更新用户共享配额池上限失败:', error.message);
+      throw error;
+    }
+  }
+
+  /**
+   * 增加用户共享配额池的配额（添加共享账号时调用）
+   * @param {string} user_id - 用户ID
+   * @param {string} model_name - 模型名称
+   * @param {number} account_quota - 账号的模型配额（0-1之间的小数）
+   * @returns {Promise<Object>} 更新后的配额池信息
+   */
+  async addUserSharedQuota(user_id, model_name, account_quota) {
+    try {
+      // 增加的配额 = 账号配额 * 2
+      const quota_to_add = parseFloat((account_quota * 2).toFixed(4));
+      // 新的 max_quota 增量
+      const max_quota_increment = 2;
+      
+      // 使用 UPSERT 来处理插入或更新
+      const result = await database.query(
+        `INSERT INTO user_shared_quota_pool (user_id, model_name, quota, max_quota)
+         VALUES ($1::uuid, $2, LEAST($3::numeric, $4::numeric), $4::numeric)
+         ON CONFLICT (user_id, model_name)
+         DO UPDATE SET
+           quota = LEAST(user_shared_quota_pool.quota + $3::numeric, user_shared_quota_pool.max_quota + $4::numeric),
+           max_quota = user_shared_quota_pool.max_quota + $4::numeric,
+           last_updated_at = CURRENT_TIMESTAMP
+         RETURNING *`,
+        [user_id, model_name, quota_to_add, max_quota_increment]
+      );
+      
+      logger.info(`用户共享配额已增加: user_id=${user_id}, model=${model_name}, added_quota=${quota_to_add}, quota=${result.rows[0].quota}, max_quota=${result.rows[0].max_quota}`);
+      return result.rows[0];
+    } catch (error) {
+      logger.error('增加用户共享配额失败:', error.message);
+      throw error;
+    }
+  }
+
+  /**
+   * 减少用户共享配额池的配额（删除共享账号时调用）
+   * @param {string} user_id - 用户ID
+   * @param {string} model_name - 模型名称
+   * @param {number} account_quota - 账号的模型配额（0-1之间的小数）
+   * @returns {Promise<Object|null>} 更新后的配额池信息
+   */
+  async removeUserSharedQuota(user_id, model_name, account_quota) {
+    try {
+      // 减少的配额 = 账号配额 * 2
+      const quota_to_remove = parseFloat((account_quota * 2).toFixed(4));
+      
+      const result = await database.query(
+        `UPDATE user_shared_quota_pool
+         SET quota = GREATEST(quota - $3::numeric, 0),
+             max_quota = GREATEST(max_quota - 2::numeric, 0),
+             last_updated_at = CURRENT_TIMESTAMP
+         WHERE user_id = $1::uuid AND model_name = $2
+         RETURNING *`,
+        [user_id, model_name, quota_to_remove]
+      );
+      
+      if (result.rows.length > 0) {
+        logger.info(`用户共享配额已减少: user_id=${user_id}, model=${model_name}, removed_quota=${quota_to_remove}, new_quota=${result.rows[0].quota}, new_max_quota=${result.rows[0].max_quota}`);
+        return result.rows[0];
+      }
+      return null;
+    } catch (error) {
+      logger.error('减少用户共享配额失败:', error.message);
       throw error;
     }
   }
@@ -388,36 +457,49 @@ class QuotaService {
 
   /**
    * 恢复用户共享配额池（定时任务调用）
-   * 每小时每模型恢复 2n * 0.2，n为用户有效的共享cookie数
+   * 每小时每模型恢复 = 0.012 * 免费账号数 + 0.4 * 付费账号数
    * @param {string} user_id - 用户ID
    * @param {string} model_name - 模型名称
    * @returns {Promise<Object>} 更新后的配额池信息
    */
   async recoverUserSharedQuota(user_id, model_name) {
     try {
-      // 获取用户有效的共享cookie数量
+      // 获取用户有效的共享账号数量（分免费和付费）
       const countResult = await database.query(
-        'SELECT get_user_shared_cookie_count($1) as count',
+        `SELECT
+           COUNT(*) FILTER (WHERE paid_tier = false) as free_count,
+           COUNT(*) FILTER (WHERE paid_tier = true) as paid_count
+         FROM accounts
+         WHERE user_id = $1::uuid
+           AND is_shared = 1
+           AND status = 1`,
         [user_id]
       );
-      const cookieCount = parseInt(countResult.rows[0].count);
+      const freeCount = parseInt(countResult.rows[0].free_count) || 0;
+      const paidCount = parseInt(countResult.rows[0].paid_count) || 0;
       
-      // 计算恢复量：2n * 0.2
-      const recoveryAmount = 2 * cookieCount * 0.2;
+      // 计算恢复量：0.012 * 免费账号数 + 0.4 * 付费账号数
+      const recoveryAmount = parseFloat((0.012 * freeCount + 0.4 * paidCount).toFixed(4));
+      
+      // 如果没有账号，不需要恢复
+      if (recoveryAmount === 0) {
+        logger.debug(`用户无有效共享账号，跳过恢复: user_id=${user_id}, model=${model_name}`);
+        return null;
+      }
       
       // 恢复配额（不超过上限）
       const result = await database.query(
         `UPDATE user_shared_quota_pool
-         SET quota = LEAST(quota + $3, max_quota),
+         SET quota = LEAST(quota + $3::numeric, max_quota),
              last_recovered_at = CURRENT_TIMESTAMP,
              last_updated_at = CURRENT_TIMESTAMP
-         WHERE user_id = $1 AND model_name = $2
+         WHERE user_id = $1::uuid AND model_name = $2
          RETURNING *`,
         [user_id, model_name, recoveryAmount]
       );
       
       if (result.rows.length > 0) {
-        logger.info(`用户共享配额已恢复: user_id=${user_id}, model=${model_name}, amount=${recoveryAmount}`);
+        logger.info(`用户共享配额已恢复: user_id=${user_id}, model=${model_name}, amount=${recoveryAmount} (free=${freeCount}, paid=${paidCount})`);
       }
       
       return result.rows[0] || null;
@@ -660,6 +742,57 @@ class QuotaService {
       return result.rows[0];
     } catch (error) {
       logger.error('查询用户模型消耗统计失败:', error.message);
+      throw error;
+    }
+  }
+
+  /**
+   * 获取用户所有模型的共享配额消费统计
+   * @param {string} user_id - 用户ID
+   * @returns {Promise<Array>} 各模型的消费统计列表
+   */
+  async getUserSharedConsumptionStats(user_id) {
+    try {
+      const result = await database.query(
+        `SELECT
+           model_name,
+           COUNT(*) as total_requests,
+           SUM(quota_consumed) as total_quota_consumed,
+           AVG(quota_consumed) as avg_quota_consumed,
+           MAX(consumed_at) as last_used_at
+         FROM quota_consumption_log
+         WHERE user_id = $1::uuid AND is_shared = 1
+         GROUP BY model_name
+         ORDER BY total_quota_consumed DESC`,
+        [user_id]
+      );
+      return result.rows;
+    } catch (error) {
+      logger.error('查询用户共享配额消费统计失败:', error.message);
+      throw error;
+    }
+  }
+
+  /**
+   * 获取用户所有配额消费总计（包括共享和专属账号）
+   * @param {string} user_id - 用户ID
+   * @returns {Promise<Object>} 消费总计
+   */
+  async getUserTotalConsumption(user_id) {
+    try {
+      const result = await database.query(
+        `SELECT
+           COUNT(*) as total_requests,
+           COALESCE(SUM(quota_consumed), 0) as total_quota_consumed,
+           COALESCE(SUM(CASE WHEN is_shared = 1 THEN quota_consumed ELSE 0 END), 0) as shared_quota_consumed,
+           COALESCE(SUM(CASE WHEN is_shared = 0 THEN quota_consumed ELSE 0 END), 0) as private_quota_consumed
+         FROM quota_consumption_log
+         WHERE user_id = $1::uuid`,
+        [user_id]
+      );
+      return result.rows[0];
+    } catch (error) {
+      logger.error('查询用户配额消费总计失败:', error.message);
       throw error;
     }
   }

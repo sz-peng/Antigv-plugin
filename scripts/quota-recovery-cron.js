@@ -3,8 +3,8 @@
 /**
  * 配额池自动恢复定时任务
  * 每小时执行一次，恢复用户共享配额池
- * 恢复量：每小时每模型 2n * 0.2，n为用户有效的共享cookie数
- * 
+ * 恢复量：每小时每模型 = 0.012 * 免费账号数 + 0.4 * 付费账号数
+ *
  * 使用方式：
  * 1. 单次执行：node scripts/quota-recovery-cron.js
  * 2. 添加到 crontab：0 * * * * /usr/bin/node /path/to/scripts/quota-recovery-cron.js

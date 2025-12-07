@@ -238,6 +238,34 @@ class AccountService {
   }
 
   /**
+   * 更新账号共享类型
+   * @param {string} cookie_id - Cookie ID
+   * @param {number} is_shared - 是否共享 (0=专属, 1=共享)
+   * @returns {Promise<Object>} 更新后的账号信息
+   */
+  async updateAccountSharedType(cookie_id, is_shared) {
+    try {
+      const result = await database.query(
+        `UPDATE accounts
+         SET is_shared = $1, updated_at = CURRENT_TIMESTAMP
+         WHERE cookie_id = $2
+         RETURNING *`,
+        [is_shared, cookie_id]
+      );
+
+      if (result.rows.length === 0) {
+        throw new Error(`账号不存在: cookie_id=${cookie_id}`);
+      }
+
+      logger.info(`账号共享类型已更新: cookie_id=${cookie_id}, is_shared=${is_shared}`);
+      return result.rows[0];
+    } catch (error) {
+      logger.error('更新账号共享类型失败:', error.message);
+      throw error;
+    }
+  }
+
+  /**
    * 删除账号
    * @param {string} cookie_id - Cookie ID
    * @returns {Promise<boolean>} 是否删除成功
