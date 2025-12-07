@@ -257,6 +257,11 @@ class MultiAccountClient {
             callback({ type: 'error', content: 'RESOURCE_EXHAUSTED' });
             return;
           }
+          // 检查是否是 INVALID_ARGUMENT 错误（请求参数问题，不应禁用账号）
+          if (responseText.includes('INVALID_ARGUMENT')) {
+            logger.warn(`[400错误] INVALID_ARGUMENT，不禁用账号: cookie_id=${account.cookie_id}, error=${responseText.substring(0, 200)}`);
+            throw new ApiError(responseText, response.status, responseText);
+          }
           // 其他400错误，禁用账号
           logger.warn(`账号请求失败(400)，已禁用: cookie_id=${account.cookie_id}, error=${responseText.substring(0, 200)}`);
           await accountService.updateAccountStatus(account.cookie_id, 0);
@@ -669,6 +674,11 @@ class MultiAccountClient {
           if (responseText.includes('quota') || responseText.includes('RESOURCE_EXHAUSTED')) {
             logger.error(`[图片生成-400错误] project_id_0 配额耗尽`);
             throw new ApiError('RESOURCE_EXHAUSTED', response.status, 'RESOURCE_EXHAUSTED');
+          }
+          // 检查是否是 INVALID_ARGUMENT 错误（请求参数问题，不应禁用账号）
+          if (responseText.includes('INVALID_ARGUMENT')) {
+            logger.warn(`[图片生成-400错误] INVALID_ARGUMENT，不禁用账号: cookie_id=${account.cookie_id}, error=${responseText.substring(0, 200)}`);
+            throw new ApiError(responseText, response.status, responseText);
           }
           // 其他400错误，禁用账号
           logger.warn(`账号请求失败(400)，已禁用: cookie_id=${account.cookie_id}, error=${responseText.substring(0, 200)}`);
