@@ -171,11 +171,12 @@ class MultiAccountClient {
    * @param {Object} user - 用户对象
    * @param {Array} originalMessages - 原始 OpenAI 格式的消息数组（用于 signature 管理）
    * @param {Object} account - 账号对象（可选，如果不提供则自动获取）
+   * @param {Array} excludeCookieIds - 要排除的cookie_id列表（用于重试时排除已失败的账号）
    */
-  async generateResponse(requestBody, callback, user_id, model_name, user, originalMessages = [], account = null, excludeProjectIds = []) {
+  async generateResponse(requestBody, callback, user_id, model_name, user, originalMessages = [], account = null, excludeCookieIds = []) {
     // 如果没有提供 account，则获取一个
     if (!account) {
-      account = await this.getAvailableAccount(user_id, model_name, user);
+      account = await this.getAvailableAccount(user_id, model_name, user, excludeCookieIds);
     }
     
     // 判断是否为 Gemini 模型
@@ -251,31 +252,85 @@ class MultiAccountClient {
         
         // 检查是否是400错误（可能是账号问题）
         if (response.status === 400) {
-          // 检查是否是配额耗尽错误
+          // 检查是否是配额耗尽错误，自动更换账号重试
           if (responseText.includes('quota') || responseText.includes('RESOURCE_EXHAUSTED')) {
-            logger.error(`[400错误] project_id_0 配额耗尽`);
-            callback({ type: 'error', content: 'RESOURCE_EXHAUSTED' });
-            return;
+            logger.warn(`[400错误] 账号配额耗尽，尝试更换账号重试: cookie_id=${account.cookie_id}`);
+            
+            // 将当前账号加入排除列表
+            const newExcludeList = [...excludeCookieIds, account.cookie_id];
+            
+            try {
+              // 尝试获取新账号并重试
+              const newAccount = await this.getAvailableAccount(user_id, model_name, user, newExcludeList);
+              logger.info(`已获取新账号，重试请求: new_cookie_id=${newAccount.cookie_id}`);
+              
+              // 更新 requestBody 中的 project
+              if (newAccount.project_id_0) {
+                requestBody.project = newAccount.project_id_0;
+              }
+              
+              // 递归调用，使用新账号重试
+              return await this.generateResponse(requestBody, callback, user_id, model_name, user, originalMessages, newAccount, newExcludeList);
+            } catch (retryError) {
+              // 如果没有更多可用账号，返回配额耗尽错误
+              logger.error(`所有账号配额已耗尽，无法重试: ${retryError.message}`);
+              callback({ type: 'error', content: 'RESOURCE_EXHAUSTED' });
+              return;
+            }
           }
-          // 检查是否是 INVALID_ARGUMENT 错误（请求参数问题，不应禁用账号）
-          if (responseText.includes('INVALID_ARGUMENT')) {
-            logger.warn(`[400错误] INVALID_ARGUMENT，不禁用账号: cookie_id=${account.cookie_id}, error=${responseText.substring(0, 200)}`);
+          // 检查是否是 INVALID_ARGUMENT 或 invalid_request_error 错误（请求参数问题，不应禁用账号）
+          if (responseText.includes('INVALID_ARGUMENT') || responseText.includes('invalid_request_error')) {
+            logger.warn(`[400错误] 参数错误(INVALID_ARGUMENT/invalid_request_error)，不禁用账号: cookie_id=${account.cookie_id}, error=${responseText.substring(0, 200)}`);
+            // 将上游响应传递给回调，以便 dump
+            callback({ type: 'error', content: responseText, upstreamResponse: responseText, upstreamRequest: requestBody });
             throw new ApiError(responseText, response.status, responseText);
           }
           // 其他400错误，禁用账号
           logger.warn(`账号请求失败(400)，已禁用: cookie_id=${account.cookie_id}, error=${responseText.substring(0, 200)}`);
           await accountService.updateAccountStatus(account.cookie_id, 0);
+          // 将上游响应传递给回调，以便 dump
+          callback({ type: 'error', content: responseText, upstreamResponse: responseText, upstreamRequest: requestBody });
           throw new ApiError(responseText, response.status, responseText);
         }
         
-        // 检查是否是配额耗尽错误
+        // 检查是否是429配额耗尽错误，自动更换账号重试
         if (response.status === 429 || responseText.includes('quota') || responseText.includes('RESOURCE_EXHAUSTED')) {
-          logger.error(`[429错误] project_id_0 配额耗尽`);
-          callback({ type: 'error', content: 'RESOURCE_EXHAUSTED' });
-          return;
-        } else {
-          throw new ApiError(responseText, response.status, responseText);
+          logger.warn(`[429错误] 账号配额耗尽，尝试更换账号重试: cookie_id=${account.cookie_id}`);
+          
+          // 将当前账号加入排除列表
+          const newExcludeList = [...excludeCookieIds, account.cookie_id];
+          
+          try {
+            // 尝试获取新账号并重试
+            const newAccount = await this.getAvailableAccount(user_id, model_name, user, newExcludeList);
+            logger.info(`已获取新账号，重试请求: new_cookie_id=${newAccount.cookie_id}`);
+            
+            // 更新 requestBody 中的 project
+            if (newAccount.project_id_0) {
+              requestBody.project = newAccount.project_id_0;
+            }
+            
+            // 递归调用，使用新账号重试
+            return await this.generateResponse(requestBody, callback, user_id, model_name, user, originalMessages, newAccount, newExcludeList);
+          } catch (retryError) {
+            // 如果没有更多可用账号，返回配额耗尽错误
+            logger.error(`所有账号配额已耗尽，无法重试: ${retryError.message}`);
+            callback({ type: 'error', content: 'RESOURCE_EXHAUSTED' });
+            return;
+          }
         }
+        
+        // 检查是否是500错误且包含 "Internal error encountered"
+        if (response.status === 500 && responseText.includes('Internal error encountered')) {
+          logger.error(`[500错误] Internal error encountered，返回 ILLEGAL_PROMPT`);
+          callback({ type: 'error', content: 'ILLEGAL_PROMPT', upstreamResponse: responseText, upstreamRequest: requestBody });
+          throw new ApiError('ILLEGAL_PROMPT', 500, 'ILLEGAL_PROMPT');
+        }
+        
+        // 其他错误
+        // 将上游响应传递给回调，以便 dump
+        callback({ type: 'error', content: responseText, upstreamResponse: responseText, upstreamRequest: requestBody });
+        throw new ApiError(responseText, response.status, responseText);
       }
       
     } catch (error) {
@@ -606,12 +661,13 @@ class MultiAccountClient {
    * @param {string} model_name - 模型名称
    * @param {Object} user - 用户对象
    * @param {Object} account - 账号对象（可选，如果不提供则自动获取）
+   * @param {Array} excludeCookieIds - 要排除的cookie_id列表（用于重试时排除已失败的账号）
    * @returns {Promise<Object>} 图片生成响应
    */
-  async generateImage(requestBody, user_id, model_name, user, account = null, excludeProjectIds = []) {
+  async generateImage(requestBody, user_id, model_name, user, account = null, excludeCookieIds = []) {
     // 如果没有提供 account，则获取一个
     if (!account) {
-      account = await this.getAvailableAccount(user_id, model_name, user);
+      account = await this.getAvailableAccount(user_id, model_name, user, excludeCookieIds);
     }
     
     // 获取请求前的配额信息
@@ -670,14 +726,34 @@ class MultiAccountClient {
         
         // 检查是否是400错误
         if (response.status === 400) {
-          // 检查是否是配额耗尽错误
+          // 检查是否是配额耗尽错误，自动更换账号重试
           if (responseText.includes('quota') || responseText.includes('RESOURCE_EXHAUSTED')) {
-            logger.error(`[图片生成-400错误] project_id_0 配额耗尽`);
-            throw new ApiError('RESOURCE_EXHAUSTED', response.status, 'RESOURCE_EXHAUSTED');
+            logger.warn(`[图片生成-400错误] 账号配额耗尽，尝试更换账号重试: cookie_id=${account.cookie_id}`);
+            
+            // 将当前账号加入排除列表
+            const newExcludeList = [...excludeCookieIds, account.cookie_id];
+            
+            try {
+              // 尝试获取新账号并重试
+              const newAccount = await this.getAvailableAccount(user_id, model_name, user, newExcludeList);
+              logger.info(`[图片生成] 已获取新账号，重试请求: new_cookie_id=${newAccount.cookie_id}`);
+              
+              // 更新 requestBody 中的 project
+              if (newAccount.project_id_0) {
+                requestBody.project = newAccount.project_id_0;
+              }
+              
+              // 递归调用，使用新账号重试
+              return await this.generateImage(requestBody, user_id, model_name, user, newAccount, newExcludeList);
+            } catch (retryError) {
+              // 如果没有更多可用账号，返回配额耗尽错误
+              logger.error(`[图片生成] 所有账号配额已耗尽，无法重试: ${retryError.message}`);
+              throw new ApiError('RESOURCE_EXHAUSTED', 429, 'RESOURCE_EXHAUSTED');
+            }
           }
-          // 检查是否是 INVALID_ARGUMENT 错误（请求参数问题，不应禁用账号）
-          if (responseText.includes('INVALID_ARGUMENT')) {
-            logger.warn(`[图片生成-400错误] INVALID_ARGUMENT，不禁用账号: cookie_id=${account.cookie_id}, error=${responseText.substring(0, 200)}`);
+          // 检查是否是 INVALID_ARGUMENT 或 invalid_request_error 错误（请求参数问题，不应禁用账号）
+          if (responseText.includes('INVALID_ARGUMENT') || responseText.includes('invalid_request_error')) {
+            logger.warn(`[图片生成-400错误] 参数错误(INVALID_ARGUMENT/invalid_request_error)，不禁用账号: cookie_id=${account.cookie_id}, error=${responseText.substring(0, 200)}`);
             throw new ApiError(responseText, response.status, responseText);
           }
           // 其他400错误，禁用账号
@@ -686,13 +762,40 @@ class MultiAccountClient {
           throw new ApiError(responseText, response.status, responseText);
         }
         
-        // 检查是否是429配额耗尽错误
+        // 检查是否是429配额耗尽错误，自动更换账号重试
         if (response.status === 429 || responseText.includes('quota') || responseText.includes('RESOURCE_EXHAUSTED')) {
-          logger.error(`[图片生成-429错误] project_id_0 配额耗尽`);
-          throw new ApiError('RESOURCE_EXHAUSTED', response.status, 'RESOURCE_EXHAUSTED');
-        } else {
-          throw new ApiError(responseText, response.status, responseText);
+          logger.warn(`[图片生成-429错误] 账号配额耗尽，尝试更换账号重试: cookie_id=${account.cookie_id}`);
+          
+          // 将当前账号加入排除列表
+          const newExcludeList = [...excludeCookieIds, account.cookie_id];
+          
+          try {
+            // 尝试获取新账号并重试
+            const newAccount = await this.getAvailableAccount(user_id, model_name, user, newExcludeList);
+            logger.info(`[图片生成] 已获取新账号，重试请求: new_cookie_id=${newAccount.cookie_id}`);
+            
+            // 更新 requestBody 中的 project
+            if (newAccount.project_id_0) {
+              requestBody.project = newAccount.project_id_0;
+            }
+            
+            // 递归调用，使用新账号重试
+            return await this.generateImage(requestBody, user_id, model_name, user, newAccount, newExcludeList);
+          } catch (retryError) {
+            // 如果没有更多可用账号，返回配额耗尽错误
+            logger.error(`[图片生成] 所有账号配额已耗尽，无法重试: ${retryError.message}`);
+            throw new ApiError('RESOURCE_EXHAUSTED', 429, 'RESOURCE_EXHAUSTED');
+          }
         }
+        
+        // 检查是否是500错误且包含 "Internal error encountered"
+        if (response.status === 500 && responseText.includes('Internal error encountered')) {
+          logger.error(`[图片生成-500错误] Internal error encountered，返回 ILLEGAL_PROMPT`);
+          throw new ApiError('ILLEGAL_PROMPT', 500, 'ILLEGAL_PROMPT');
+        }
+        
+        // 其他错误
+        throw new ApiError(responseText, response.status, responseText);
       }
       
     } catch (error) {

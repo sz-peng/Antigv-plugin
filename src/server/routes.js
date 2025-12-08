@@ -4,7 +4,7 @@ import accountService from '../services/account.service.js';
 import quotaService from '../services/quota.service.js';
 import userService from '../services/user.service.js';
 import multiAccountClient from '../api/multi_account_client.js';
-import { generateRequestBody } from '../utils/utils.js';
+import { generateRequestBody, dumpErrorArtifacts } from '../utils/utils.js';
 import logger from '../utils/logger.js';
 import config from '../config/config.js';
 import { countStringTokens } from '../utils/token_counter.js';
@@ -1166,19 +1166,26 @@ router.post('/v1/chat/completions', authenticateApiKey, async (req, res) => {
     }
   } else {
     // 使用 antigravity 账号系统（默认）
-    // 先获取账号信息以便传递给 generateRequestBody
-    const account = await multiAccountClient.getAvailableAccount(req.user.user_id, model, req.user);
-    const requestBody = await generateRequestBody(messages, model, params, tools, req.user.user_id, account);
+    let account, requestBody, promptTokens;
 
-    // 计算输入token数
-    const inputText = messages.map(m => {
-      if (typeof m.content === 'string') return m.content;
-      if (Array.isArray(m.content)) {
-        return m.content.filter(c => c.type === 'text').map(c => c.text).join('');
-      }
-      return '';
-    }).join('\n');
-    const promptTokens = countStringTokens(inputText, model);
+    try {
+      // 先获取账号信息以便传递给 generateRequestBody
+      account = await multiAccountClient.getAvailableAccount(req.user.user_id, model, req.user);
+      requestBody = await generateRequestBody(messages, model, params, tools, req.user.user_id, account);
+
+      // 计算输入token数
+      const inputText = messages.map(m => {
+        if (typeof m.content === 'string') return m.content;
+        if (Array.isArray(m.content)) {
+          return m.content.filter(c => c.type === 'text').map(c => c.text).join('');
+        }
+        return '';
+      }).join('\n');
+      promptTokens = countStringTokens(inputText, model);
+    } catch (error) {
+      logger.warn(`准备请求失败: ${error.message}`);
+      return res.status(500).json({ error: error.message });
+    }
 
     if (stream) {
       // 流式响应始终返回200，错误通过流传递
@@ -1197,8 +1204,13 @@ router.post('/v1/chat/completions', authenticateApiKey, async (req, res) => {
       let hasError = false; // 标记是否发生错误
       
       try {
-        await multiAccountClient.generateResponse(requestBody, (data) => {
+        await multiAccountClient.generateResponse(requestBody, async (data) => {
           if (data.type === 'error') {
+            // 尝试转储错误现场
+            if (data.upstreamResponse) {
+              await dumpErrorArtifacts(req.body, data.upstreamRequest || requestBody, data.upstreamResponse, data.content);
+            }
+
             // 处理错误：在流中发送错误信息
             hasError = true;
             res.write(`data: ${JSON.stringify({
@@ -1297,6 +1309,12 @@ router.post('/v1/chat/completions', authenticateApiKey, async (req, res) => {
       } catch (error) {
         // 流式错误处理：在流中发送错误信息
         logger.error('生成响应失败:', error.message);
+        
+        // 尝试转储错误现场（如果是 ApiError，通常包含了 responseText）
+        if (error.name === 'ApiError' && error.responseText) {
+           await dumpErrorArtifacts(req.body, requestBody, error.responseText, error.message);
+        }
+
         res.write(`data: ${JSON.stringify({
           id,
           object: 'chat.completion.chunk',
@@ -1376,6 +1394,12 @@ router.post('/v1/chat/completions', authenticateApiKey, async (req, res) => {
         });
       } catch (error) {
         logger.error('生成响应失败:', error.message);
+        
+        // 尝试转储错误现场
+        if (error.name === 'ApiError' && error.responseText) {
+           await dumpErrorArtifacts(req.body, requestBody, error.responseText, error.message);
+        }
+
         const statusCode = error.statusCode || 500;
         const errorMessage = error.responseText || error.message;
         res.status(statusCode).json({ error: errorMessage });

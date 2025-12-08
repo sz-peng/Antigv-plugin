@@ -444,14 +444,16 @@ class QuotaService {
       );
       
       if (result.rows.length === 0) {
-        throw new Error('用户共享配额池不存在');
+        logger.warn(`用户共享配额池不存在，跳过扣减: user_id=${user_id}, model=${model_name}`);
+        return null;
       }
       
       logger.info(`用户共享配额已扣减: user_id=${user_id}, model=${model_name}, amount=${amount}`);
       return result.rows[0];
     } catch (error) {
       logger.error('扣减用户共享配额失败:', error.message);
-      throw error;
+      // 不抛出错误，以免影响主流程
+      return null;
     }
   }
 

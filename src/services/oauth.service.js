@@ -121,8 +121,6 @@ class OAuthService {
       };
       
       const req = https.request(options, (res) => {
-        const responseStartTime = Date.now();
-        
         let body = '';
         let chunkCount = 0;
         let totalBytes = 0;
@@ -134,9 +132,6 @@ class OAuthService {
         });
         
         res.on('end', () => {
-          const totalTime = Date.now() - startTime;
-          const responseTime = Date.now() - responseStartTime;
-          
           if (res.statusCode === 200) {
             try {
               const tokenData = JSON.parse(body);
@@ -180,8 +175,6 @@ class OAuthService {
       
       req.write(data);
       req.end();
-      
-      logger.info(`[${requestId}] 请求已发送，等待响应...`);
     });
   }
 
@@ -193,14 +186,6 @@ class OAuthService {
   async refreshAccessToken(refresh_token) {
     const requestId = crypto.randomUUID().substring(0, 8);
     const startTime = Date.now();
-    
-    logger.info(`[${requestId}] 开始刷新Token流程`);
-    logger.info(`[${requestId}] 请求参数:`, {
-      refresh_token_length: refresh_token ? refresh_token.length : 0,
-      client_id: CLIENT_ID,
-      grant_type: 'refresh_token',
-      has_client_secret: !!CLIENT_SECRET
-    });
     
     return new Promise((resolve, reject) => {
       const postData = new URLSearchParams({
@@ -236,8 +221,6 @@ class OAuthService {
         });
         
         res.on('end', () => {
-          const totalTime = Date.now() - startTime;
-          const responseTime = Date.now() - responseStartTime;
           
           if (res.statusCode === 200) {
             try {
@@ -267,14 +250,7 @@ class OAuthService {
               if (errorData.error === 'invalid_grant') {
                 isInvalidGrant = true;
                 logger.error(`[${requestId}] Token刷新失败 - invalid_grant:`, {
-                  ...errorInfo,
-                  possible_causes: [
-                    'refresh_token已过期（Google refresh_token通常6个月后过期）',
-                    'refresh_token已被撤销',
-                    '用户已更改密码',
-                    '用户已撤销应用授权',
-                    'refresh_token已被使用过（某些情况下只能使用一次）'
-                  ]
+                  ...errorInfo
                 });
               } else {
                 logger.error(`[${requestId}] Token刷新失败:`, errorInfo);
@@ -314,7 +290,6 @@ class OAuthService {
       req.write(data);
       req.end();
       
-      logger.info(`[${requestId}] 请求已发送，等待响应...`);
     });
   }
 
@@ -538,23 +513,18 @@ class OAuthService {
     // 如果是共享cookie，增加用户共享配额池
     // quota += 账号配额 * 2，max_quota += 2
     if (is_shared === 1) {
-      logger.info(`开始更新用户共享配额池: user_id=${user_id}, is_shared=${is_shared}, modelNames=${modelNames.length}`);
       for (const modelName of modelNames) {
         // 获取该模型的配额值
         const modelInfo = mergedModels[modelName];
         const accountQuota = modelInfo?.quotaInfo?.remainingFraction ?? 1.0;
         
-        logger.info(`准备增加共享配额: user_id=${user_id}, model=${modelName}, accountQuota=${accountQuota}`);
-        
         // 增加用户共享配额
         try {
-          const result = await quotaService.addUserSharedQuota(user_id, modelName, accountQuota);
-          logger.info(`共享配额增加成功: user_id=${user_id}, model=${modelName}, quota=${result?.quota}, max_quota=${result?.max_quota}`);
+          await quotaService.addUserSharedQuota(user_id, modelName, accountQuota);
         } catch (error) {
           logger.error(`共享配额增加失败: user_id=${user_id}, model=${modelName}, error=${error.message}`);
         }
       }
-      logger.info(`用户共享配额池已更新: user_id=${user_id}, 更新了${modelNames.length}个模型`);
     } else {
       logger.info(`非共享账号，跳过更新用户共享配额池: user_id=${user_id}, is_shared=${is_shared}`);
     }
