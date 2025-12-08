@@ -339,7 +339,7 @@ function isInvalidAssistantMessage(message) {
 
 function openaiMessageToAntigravity(openaiMessages, enableThinking, isCompletionModel = false, modelName = '', signature = null) {
   // 过滤掉无效的助手消息（只包含单个 "{" 字符的消息）
-  const filteredMessages = openaiMessages.filter(message => !isInvalidAssistantMessage(message));
+  let filteredMessages = openaiMessages.filter(message => !isInvalidAssistantMessage(message));
 
   // 补全模型只需要最后一条用户消息作为提示
   if (isCompletionModel) {
@@ -365,20 +365,20 @@ function openaiMessageToAntigravity(openaiMessages, enableThinking, isCompletion
   const isImageModel = modelName.endsWith('-image');
 
   // 对于思考模型，检查最后一条助手消息是否有思考内容
-  // 如果没有，需要使用特殊的 signature 来跳过验证
-  let effectiveSignature = signature;
+  // 如果没有思考内容，直接移除该消息，避免需要伪造签名
   if (enableThinking && !isImageModel) {
-    // 找到最后一条助手消息
-    let lastAssistantMessage = null;
+    // 找到最后一条助手消息的索引
+    let lastAssistantIndex = -1;
     for (let i = filteredMessages.length - 1; i >= 0; i--) {
       if (filteredMessages[i].role === 'assistant') {
-        lastAssistantMessage = filteredMessages[i];
+        lastAssistantIndex = i;
         break;
       }
     }
 
     // 检查最后一条助手消息是否有思考内容
-    if (lastAssistantMessage) {
+    if (lastAssistantIndex !== -1) {
+      const lastAssistantMessage = filteredMessages[lastAssistantIndex];
       const content = typeof lastAssistantMessage.content === 'string'
         ? lastAssistantMessage.content
         : (Array.isArray(lastAssistantMessage.content)
@@ -387,10 +387,10 @@ function openaiMessageToAntigravity(openaiMessages, enableThinking, isCompletion
       
       const hasThinkingContent = /<think>[\s\S]*?<\/think>/.test(content);
       
-      // 如果最后一条助手消息没有思考内容，使用特殊 signature
+      // 如果最后一条助手消息没有思考内容，移除该消息
       if (!hasThinkingContent) {
-        effectiveSignature = "skip_thought_signature_validator";
-        logger.info('最后一条助手消息没有思考内容，使用 skip_thought_signature_validator');
+        logger.info('最后一条助手消息没有思考内容，移除该消息');
+        filteredMessages = filteredMessages.filter((_, index) => index !== lastAssistantIndex);
       }
     }
   }
@@ -400,9 +400,9 @@ function openaiMessageToAntigravity(openaiMessages, enableThinking, isCompletion
       const extracted = extractImagesFromContent(message.content);
       handleUserMessage(extracted, antigravityMessages, enableThinking);
     } else if (message.role === "assistant") {
-      handleAssistantMessage(message, antigravityMessages, isImageModel, enableThinking, effectiveSignature);
+      handleAssistantMessage(message, antigravityMessages, isImageModel, enableThinking, signature);
     } else if (message.role === "tool") {
-      handleToolCall(message, antigravityMessages, enableThinking, effectiveSignature);
+      handleToolCall(message, antigravityMessages, enableThinking, signature);
     }
   }
 
