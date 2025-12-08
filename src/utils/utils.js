@@ -260,12 +260,92 @@ function handleToolCall(message, antigravityMessages, enableThinking = false, si
     });
   }
 }
+/**
+ * 检查助手消息是否是无效的
+ * 无效消息包括：
+ * 1. 只包含单个 "{" 字符的消息
+ * 2. content 数组中包含空块或结构不正确的元素
+ * 这种消息通常是由于客户端错误产生的，需要被过滤掉
+ * @param {Object} message - OpenAI 格式的消息对象
+ * @returns {boolean} 如果消息无效返回 true
+ */
+function isInvalidAssistantMessage(message) {
+  if (message.role !== 'assistant') {
+    return false;
+  }
+
+  // 检查 content 是否是数组格式
+  if (Array.isArray(message.content)) {
+    // 空数组视为无效
+    if (message.content.length === 0) {
+      return true;
+    }
+
+    // 检查是否只有一个元素
+    if (message.content.length === 1) {
+      const item = message.content[0];
+      
+      // 检查元素是否是 text 类型，内容为 "{"
+      if (item.type === 'text' && item.text === '{') {
+        return true;
+      }
+      
+      // 检查元素是否是空块或结构不正确
+      // 情况1: text 类型但 text 字段为空、undefined、null 或不是字符串
+      if (item.type === 'text') {
+        if (item.text === undefined || item.text === null || item.text === '') {
+          return true;
+        }
+        // 情况2: text 字段不是字符串（例如是对象）
+        if (typeof item.text !== 'string') {
+          return true;
+        }
+      }
+      
+      // 情况3: 元素没有 type 字段或 type 不是有效值
+      if (!item.type) {
+        return true;
+      }
+    }
+
+    // 检查所有元素是否都是空的或无效的
+    const hasValidContent = message.content.some(item => {
+      if (item.type === 'text') {
+        return typeof item.text === 'string' && item.text.trim() !== '' && item.text !== '{';
+      }
+      // 其他类型（如 image_url）视为有效
+      return item.type && item.type !== 'text';
+    });
+    
+    if (!hasValidContent) {
+      return true;
+    }
+  }
+
+  // 检查 content 是否是字符串格式，内容为 "{" 或空字符串
+  if (typeof message.content === 'string') {
+    if (message.content === '{' || message.content.trim() === '') {
+      return true;
+    }
+  }
+
+  // 检查 content 是否为 null 或 undefined
+  if (message.content === null || message.content === undefined) {
+    return true;
+  }
+
+  return false;
+}
+
 function openaiMessageToAntigravity(openaiMessages, enableThinking, isCompletionModel = false, modelName = '', signature = null) {
+  // 过滤掉无效的助手消息（只包含单个 "{" 字符的消息）
+  const filteredMessages = openaiMessages.filter(message => !isInvalidAssistantMessage(message));
+
   // 补全模型只需要最后一条用户消息作为提示
   if (isCompletionModel) {
     // 将所有消息合并为一个提示词
     let prompt = '';
-    for (const message of openaiMessages) {
+    for (const message of filteredMessages) {
       if (message.role === 'system') {
         prompt += message.content + '\n\n';
       } else if (message.role === 'user') {
@@ -284,7 +364,7 @@ function openaiMessageToAntigravity(openaiMessages, enableThinking, isCompletion
   const antigravityMessages = [];
   const isImageModel = modelName.endsWith('-image');
 
-  for (const message of openaiMessages) {
+  for (const message of filteredMessages) {
     if (message.role === "user" || message.role === "system") {
       const extracted = extractImagesFromContent(message.content);
       handleUserMessage(extracted, antigravityMessages, enableThinking);

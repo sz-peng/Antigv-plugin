@@ -25,3 +25,4 @@ config.json
 pnpm-lock.yaml
 test/*
 migrations/
+errordump*
