@@ -172,8 +172,9 @@ class MultiAccountClient {
    * @param {Array} originalMessages - 原始 OpenAI 格式的消息数组（用于 signature 管理）
    * @param {Object} account - 账号对象（可选，如果不提供则自动获取）
    * @param {Array} excludeCookieIds - 要排除的cookie_id列表（用于重试时排除已失败的账号）
+   * @param {number} retryCount - 429错误重试计数（最多3次）
    */
-  async generateResponse(requestBody, callback, user_id, model_name, user, originalMessages = [], account = null, excludeCookieIds = []) {
+  async generateResponse(requestBody, callback, user_id, model_name, user, originalMessages = [], account = null, excludeCookieIds = [], retryCount = 0) {
     // 如果没有提供 account，则获取一个
     if (!account) {
       account = await this.getAvailableAccount(user_id, model_name, user, excludeCookieIds);
@@ -278,6 +279,39 @@ class MultiAccountClient {
               return;
             }
           }
+          // 检查是否是图片超过5MB的错误
+          if (responseText.includes('image exceeds 5 MB maximum')) {
+            logger.warn(`[400错误] 图片超过5MB限制`);
+            callback({ type: 'error', content: 'IMAGE_INPUT_EXCEEDED_MAXIMUM_5_MB' });
+            throw new ApiError('IMAGE_INPUT_EXCEEDED_MAXIMUM_5_MB', 400, 'IMAGE_INPUT_EXCEEDED_MAXIMUM_5_MB');
+          }
+          // 检查是否是 RESOURCE_PROJECT_INVALID 错误，禁用账号并换号重试
+          if (responseText.includes('RESOURCE_PROJECT_INVALID')) {
+            logger.warn(`[400错误] RESOURCE_PROJECT_INVALID，禁用账号并尝试更换账号重试: cookie_id=${account.cookie_id}`);
+            await accountService.updateAccountStatus(account.cookie_id, 0);
+            
+            // 将当前账号加入排除列表
+            const newExcludeList = [...excludeCookieIds, account.cookie_id];
+            
+            try {
+              // 尝试获取新账号并重试
+              const newAccount = await this.getAvailableAccount(user_id, model_name, user, newExcludeList);
+              logger.info(`已获取新账号，重试请求: new_cookie_id=${newAccount.cookie_id}`);
+              
+              // 更新 requestBody 中的 project
+              if (newAccount.project_id_0) {
+                requestBody.project = newAccount.project_id_0;
+              }
+              
+              // 递归调用，使用新账号重试
+              return await this.generateResponse(requestBody, callback, user_id, model_name, user, originalMessages, newAccount, newExcludeList);
+            } catch (retryError) {
+              // 如果没有更多可用账号，返回错误
+              logger.error(`所有账号都不可用，无法重试: ${retryError.message}`);
+              callback({ type: 'error', content: 'RESOURCE_PROJECT_INVALID' });
+              throw new ApiError('RESOURCE_PROJECT_INVALID', 400, 'RESOURCE_PROJECT_INVALID');
+            }
+          }
           // 检查是否是 INVALID_ARGUMENT 或 invalid_request_error 错误（请求参数问题，不应禁用账号）
           if (responseText.includes('INVALID_ARGUMENT') || responseText.includes('invalid_request_error')) {
             logger.warn(`[400错误] 参数错误(INVALID_ARGUMENT/invalid_request_error)，不禁用账号: cookie_id=${account.cookie_id}, error=${responseText.substring(0, 200)}`);
@@ -293,9 +327,17 @@ class MultiAccountClient {
           throw new ApiError(responseText, response.status, responseText);
         }
         
-        // 检查是否是429配额耗尽错误，自动更换账号重试
+        // 检查是否是429配额耗尽错误，自动更换账号重试（最多5次）
         if (response.status === 429 || responseText.includes('quota') || responseText.includes('RESOURCE_EXHAUSTED')) {
-          logger.warn(`[429错误] 账号配额耗尽，尝试更换账号重试: cookie_id=${account.cookie_id}`);
+          const MAX_RETRY_COUNT = 5;
+          
+          if (retryCount >= MAX_RETRY_COUNT) {
+            logger.error(`[429错误] 已达到最大重试次数(${MAX_RETRY_COUNT})，停止重试: cookie_id=${account.cookie_id}`);
+            callback({ type: 'error', content: 'RESOURCE_EXHAUSTED' });
+            return;
+          }
+          
+          logger.warn(`[429错误] 账号配额耗尽，尝试更换账号重试(${retryCount + 1}/${MAX_RETRY_COUNT}): cookie_id=${account.cookie_id}`);
           
           // 将当前账号加入排除列表
           const newExcludeList = [...excludeCookieIds, account.cookie_id];
@@ -310,8 +352,8 @@ class MultiAccountClient {
               requestBody.project = newAccount.project_id_0;
             }
             
-            // 递归调用，使用新账号重试
-            return await this.generateResponse(requestBody, callback, user_id, model_name, user, originalMessages, newAccount, newExcludeList);
+            // 递归调用，使用新账号重试，增加重试计数
+            return await this.generateResponse(requestBody, callback, user_id, model_name, user, originalMessages, newAccount, newExcludeList, retryCount + 1);
           } catch (retryError) {
             // 如果没有更多可用账号，返回配额耗尽错误
             logger.error(`所有账号配额已耗尽，无法重试: ${retryError.message}`);
@@ -662,9 +704,10 @@ class MultiAccountClient {
    * @param {Object} user - 用户对象
    * @param {Object} account - 账号对象（可选，如果不提供则自动获取）
    * @param {Array} excludeCookieIds - 要排除的cookie_id列表（用于重试时排除已失败的账号）
+   * @param {number} retryCount - 429错误重试计数（最多3次）
    * @returns {Promise<Object>} 图片生成响应
    */
-  async generateImage(requestBody, user_id, model_name, user, account = null, excludeCookieIds = []) {
+  async generateImage(requestBody, user_id, model_name, user, account = null, excludeCookieIds = [], retryCount = 0) {
     // 如果没有提供 account，则获取一个
     if (!account) {
       account = await this.getAvailableAccount(user_id, model_name, user, excludeCookieIds);
@@ -751,6 +794,37 @@ class MultiAccountClient {
               throw new ApiError('RESOURCE_EXHAUSTED', 429, 'RESOURCE_EXHAUSTED');
             }
           }
+          // 检查是否是图片超过5MB的错误
+          if (responseText.includes('image exceeds 5 MB maximum')) {
+            logger.warn(`[图片生成-400错误] 图片超过5MB限制`);
+            throw new ApiError('IMAGE_INPUT_EXCEEDED_MAXIMUM_5_MB', 400, 'IMAGE_INPUT_EXCEEDED_MAXIMUM_5_MB');
+          }
+          // 检查是否是 RESOURCE_PROJECT_INVALID 错误，禁用账号并换号重试
+          if (responseText.includes('RESOURCE_PROJECT_INVALID')) {
+            logger.warn(`[图片生成-400错误] RESOURCE_PROJECT_INVALID，禁用账号并尝试更换账号重试: cookie_id=${account.cookie_id}`);
+            await accountService.updateAccountStatus(account.cookie_id, 0);
+            
+            // 将当前账号加入排除列表
+            const newExcludeList = [...excludeCookieIds, account.cookie_id];
+            
+            try {
+              // 尝试获取新账号并重试
+              const newAccount = await this.getAvailableAccount(user_id, model_name, user, newExcludeList);
+              logger.info(`[图片生成] 已获取新账号，重试请求: new_cookie_id=${newAccount.cookie_id}`);
+              
+              // 更新 requestBody 中的 project
+              if (newAccount.project_id_0) {
+                requestBody.project = newAccount.project_id_0;
+              }
+              
+              // 递归调用，使用新账号重试
+              return await this.generateImage(requestBody, user_id, model_name, user, newAccount, newExcludeList);
+            } catch (retryError) {
+              // 如果没有更多可用账号，返回错误
+              logger.error(`[图片生成] 所有账号都不可用，无法重试: ${retryError.message}`);
+              throw new ApiError('RESOURCE_PROJECT_INVALID', 400, 'RESOURCE_PROJECT_INVALID');
+            }
+          }
           // 检查是否是 INVALID_ARGUMENT 或 invalid_request_error 错误（请求参数问题，不应禁用账号）
           if (responseText.includes('INVALID_ARGUMENT') || responseText.includes('invalid_request_error')) {
             logger.warn(`[图片生成-400错误] 参数错误(INVALID_ARGUMENT/invalid_request_error)，不禁用账号: cookie_id=${account.cookie_id}, error=${responseText.substring(0, 200)}`);
@@ -762,9 +836,16 @@ class MultiAccountClient {
           throw new ApiError(responseText, response.status, responseText);
         }
         
-        // 检查是否是429配额耗尽错误，自动更换账号重试
+        // 检查是否是429配额耗尽错误，自动更换账号重试（最多3次）
         if (response.status === 429 || responseText.includes('quota') || responseText.includes('RESOURCE_EXHAUSTED')) {
-          logger.warn(`[图片生成-429错误] 账号配额耗尽，尝试更换账号重试: cookie_id=${account.cookie_id}`);
+          const MAX_RETRY_COUNT = 3;
+          
+          if (retryCount >= MAX_RETRY_COUNT) {
+            logger.error(`[图片生成-429错误] 已达到最大重试次数(${MAX_RETRY_COUNT})，停止重试: cookie_id=${account.cookie_id}`);
+            throw new ApiError('RESOURCE_EXHAUSTED', 429, 'RESOURCE_EXHAUSTED');
+          }
+          
+          logger.warn(`[图片生成-429错误] 账号配额耗尽，尝试更换账号重试(${retryCount + 1}/${MAX_RETRY_COUNT}): cookie_id=${account.cookie_id}`);
           
           // 将当前账号加入排除列表
           const newExcludeList = [...excludeCookieIds, account.cookie_id];
@@ -779,8 +860,8 @@ class MultiAccountClient {
               requestBody.project = newAccount.project_id_0;
             }
             
-            // 递归调用，使用新账号重试
-            return await this.generateImage(requestBody, user_id, model_name, user, newAccount, newExcludeList);
+            // 递归调用，使用新账号重试，增加重试计数
+            return await this.generateImage(requestBody, user_id, model_name, user, newAccount, newExcludeList, retryCount + 1);
           } catch (retryError) {
             // 如果没有更多可用账号，返回配额耗尽错误
             logger.error(`[图片生成] 所有账号配额已耗尽，无法重试: ${retryError.message}`);
