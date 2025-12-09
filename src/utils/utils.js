@@ -339,7 +339,7 @@ function isInvalidAssistantMessage(message) {
 
 function openaiMessageToAntigravity(openaiMessages, enableThinking, isCompletionModel = false, modelName = '', signature = null) {
   // 过滤掉无效的助手消息（只包含单个 "{" 字符的消息）
-  let filteredMessages = openaiMessages.filter(message => !isInvalidAssistantMessage(message));
+  const filteredMessages = openaiMessages.filter(message => !isInvalidAssistantMessage(message));
 
   // 补全模型只需要最后一条用户消息作为提示
   if (isCompletionModel) {
@@ -364,37 +364,6 @@ function openaiMessageToAntigravity(openaiMessages, enableThinking, isCompletion
   const antigravityMessages = [];
   const isImageModel = modelName.endsWith('-image');
 
-  // 对于思考模型，检查最后一条助手消息是否有思考内容
-  // 如果没有思考内容，直接移除该消息，避免需要伪造签名
-  if (enableThinking && !isImageModel) {
-    // 找到最后一条助手消息的索引
-    let lastAssistantIndex = -1;
-    for (let i = filteredMessages.length - 1; i >= 0; i--) {
-      if (filteredMessages[i].role === 'assistant') {
-        lastAssistantIndex = i;
-        break;
-      }
-    }
-
-    // 检查最后一条助手消息是否有思考内容
-    if (lastAssistantIndex !== -1) {
-      const lastAssistantMessage = filteredMessages[lastAssistantIndex];
-      const content = typeof lastAssistantMessage.content === 'string'
-        ? lastAssistantMessage.content
-        : (Array.isArray(lastAssistantMessage.content)
-            ? lastAssistantMessage.content.filter(c => c.type === 'text').map(c => c.text).join('')
-            : '');
-      
-      const hasThinkingContent = /<think>[\s\S]*?<\/think>/.test(content);
-      
-      // 如果最后一条助手消息没有思考内容，移除该消息
-      if (!hasThinkingContent) {
-        logger.info('最后一条助手消息没有思考内容，移除该消息');
-        filteredMessages = filteredMessages.filter((_, index) => index !== lastAssistantIndex);
-      }
-    }
-  }
-
   for (const message of filteredMessages) {
     if (message.role === "user" || message.role === "system") {
       const extracted = extractImagesFromContent(message.content);
@@ -408,10 +377,37 @@ function openaiMessageToAntigravity(openaiMessages, enableThinking, isCompletion
 
   return antigravityMessages;
 }
-function generateGenerationConfig(parameters, enableThinking, actualModelName, isNonChatModel = false) {
+/**
+ * 检查消息列表中最后一条助手消息是否包含思考内容
+ * @param {Array} messages - OpenAI 格式的消息数组
+ * @returns {boolean} 如果最后一条助手消息有思考内容返回 true，否则返回 false
+ */
+function hasThinkingContentInLastAssistant(messages) {
+  // 找到最后一条助手消息
+  for (let i = messages.length - 1; i >= 0; i--) {
+    if (messages[i].role === 'assistant') {
+      const message = messages[i];
+      const content = typeof message.content === 'string'
+        ? message.content
+        : (Array.isArray(message.content)
+            ? message.content.filter(c => c.type === 'text').map(c => c.text).join('')
+            : '');
+      
+      // 检查是否有 <think>...</think> 标签
+      return /<think>[\s\S]*?<\/think>/.test(content);
+    }
+  }
+  // 没有助手消息，返回 true（不需要禁用 thinking）
+  return true;
+}
+
+function generateGenerationConfig(parameters, enableThinking, actualModelName, isNonChatModel = false, forceDisableThinking = false) {
+  // 如果强制禁用 thinking，则覆盖 enableThinking
+  const effectiveEnableThinking = forceDisableThinking ? false : enableThinking;
+  
   // thinking 模型的 max_tokens 最小值为 2048
   let maxOutputTokens = parameters.max_tokens ?? config.defaults.max_tokens;
-  if (enableThinking && maxOutputTokens < 2048) {
+  if (effectiveEnableThinking && maxOutputTokens < 2048) {
     maxOutputTokens = 2048;
   }
 
@@ -440,12 +436,12 @@ function generateGenerationConfig(parameters, enableThinking, actualModelName, i
   // gemini-2.5-flash-image 不支持 thinkingConfig 参数
   if (actualModelName !== 'gemini-2.5-flash-image') {
     generationConfig.thinkingConfig = {
-      includeThoughts: enableThinking,
-      thinkingBudget: enableThinking ? 1024 : 0
+      includeThoughts: effectiveEnableThinking,
+      thinkingBudget: effectiveEnableThinking ? 1024 : 0
     };
   }
 
-  if (enableThinking && actualModelName.includes("claude")) {
+  if (effectiveEnableThinking && actualModelName.includes("claude")) {
     delete generationConfig.topP;
   }
 
@@ -590,6 +586,7 @@ async function generateRequestBody(openaiMessages, modelName, parameters, openai
 
   // 用于生成配置的基础模型名（去掉-thinking后缀用于某些配置判断）
   const baseModelName = actualModelName.endsWith('-thinking') ? actualModelName.slice(0, -9) : actualModelName;
+  const isImageModel = baseModelName.endsWith('-image');
 
   // 检测并拒绝不支持的模型类型
   const isChatModel = baseModelName.startsWith('chat_');  // chat_ 开头的内部补全模型
@@ -598,9 +595,9 @@ async function generateRequestBody(openaiMessages, modelName, parameters, openai
     throw new Error(`Unsupported completion model: ${baseModelName}`);
   }
 
-  // 检索存储的 signature
+  // 先检索存储的 signature（需要在判断是否禁用 thinking 之前）
   let storedSignature = null;
-  if (enableThinking && user_id) {
+  if (enableThinking && user_id && !isImageModel) {
     try {
       const { default: signatureService } = await import('../services/signature.service.js');
       // 检查是否有 tool 交互
@@ -612,11 +609,32 @@ async function generateRequestBody(openaiMessages, modelName, parameters, openai
     }
   }
 
-  // 标准对话模型使用标准格式
-  const generationConfig = generateGenerationConfig(parameters, enableThinking, baseModelName, false);
+  // 检查是否需要强制禁用 thinking
+  // 对于非 Gemini 的思考模型（如 Claude），只有在以下情况才禁用 thinking 功能：
+  // 1. 最后一条助手消息没有思考内容
+  // 2. 且没有存储的 signature 可用于注入
+  // 如果有存储的 signature，可以通过注入来满足 API 要求，不需要禁用
+  // 注意：Gemini 模型和 rev19-uic3-1p 不需要强制禁用思考，因为它们可以处理没有思考内容的情况
+  const isGeminiModel = baseModelName.startsWith('gemini-');
+  const isRev19Model = modelName === 'rev19-uic3-1p';
+  let forceDisableThinking = false;
+  if (enableThinking && !isImageModel && !isGeminiModel && !isRev19Model) {
+    const hasThinkingContent = hasThinkingContentInLastAssistant(openaiMessages);
+    if (!hasThinkingContent && !storedSignature) {
+      logger.info('最后一条助手消息没有思考内容且没有存储的 signature，禁用 thinking 功能');
+      forceDisableThinking = true;
+    }
+  }
+
+  // 计算实际的 enableThinking 状态（用于消息转换）
+  const effectiveEnableThinking = forceDisableThinking ? false : enableThinking;
+
+  // 标准对话模型使用标准格式，传入 forceDisableThinking 参数
+  const generationConfig = generateGenerationConfig(parameters, enableThinking, baseModelName, false, forceDisableThinking);
 
   // 传入 signature 参数，在消息转换时直接注入
-  const contents = openaiMessageToAntigravity(openaiMessages, enableThinking, false, baseModelName, storedSignature);
+  // 使用 effectiveEnableThinking 来决定是否启用 thinking 相关的消息处理
+  const contents = openaiMessageToAntigravity(openaiMessages, effectiveEnableThinking, false, baseModelName, storedSignature);
 
   // 优先使用账号的 project_id_0，如果不存在则随机生成
   let projectId = generateProjectId();

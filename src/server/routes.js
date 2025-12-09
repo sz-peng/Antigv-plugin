@@ -1078,39 +1078,69 @@ router.post('/v1/chat/completions', authenticateApiKey, async (req, res) => {
       const id = `chatcmpl-${Date.now()}`;
       const created = Math.floor(Date.now() / 1000);
       let hasToolCall = false;
+      let responseEnded = false;
+      
+      // 监听响应关闭事件
+      res.on('close', () => {
+        responseEnded = true;
+      });
 
       try {
         await kiroClient.generateResponse(messages, model, (data) => {
-          if (data.type === 'tool_calls') {
-            hasToolCall = true;
-            res.write(`data: ${JSON.stringify({
-              id,
-              object: 'chat.completion.chunk',
-              created,
-              model,
-              choices: [{ index: 0, delta: { tool_calls: data.tool_calls }, finish_reason: null }]
-            })}\n\n`);
-          } else {
-            res.write(`data: ${JSON.stringify({
-              id,
-              object: 'chat.completion.chunk',
-              created,
-              model,
-              choices: [{ index: 0, delta: { content: data.content }, finish_reason: null }]
-            })}\n\n`);
+          // 如果响应已结束，不再写入数据
+          if (responseEnded) {
+            return;
+          }
+          
+          try {
+            if (data.type === 'tool_calls') {
+              hasToolCall = true;
+              res.write(`data: ${JSON.stringify({
+                id,
+                object: 'chat.completion.chunk',
+                created,
+                model,
+                choices: [{ index: 0, delta: { tool_calls: data.tool_calls }, finish_reason: null }]
+              })}\n\n`);
+            } else {
+              res.write(`data: ${JSON.stringify({
+                id,
+                object: 'chat.completion.chunk',
+                created,
+                model,
+                choices: [{ index: 0, delta: { content: data.content }, finish_reason: null }]
+              })}\n\n`);
+            }
+          } catch (writeError) {
+            logger.warn(`Kiro写入响应失败: ${writeError.message}`);
+            responseEnded = true;
           }
         }, req.user.user_id, options);
 
-        res.write(`data: ${JSON.stringify({
-          id,
-          object: 'chat.completion.chunk',
-          created,
-          model,
-          choices: [{ index: 0, delta: {}, finish_reason: hasToolCall ? 'tool_calls' : 'stop' }]
-        })}\n\n`);
-        res.write('data: [DONE]\n\n');
-        res.end();
+        // 如果响应已结束，直接返回
+        if (responseEnded) {
+          return;
+        }
+
+        try {
+          res.write(`data: ${JSON.stringify({
+            id,
+            object: 'chat.completion.chunk',
+            created,
+            model,
+            choices: [{ index: 0, delta: {}, finish_reason: hasToolCall ? 'tool_calls' : 'stop' }]
+          })}\n\n`);
+          res.write('data: [DONE]\n\n');
+          res.end();
+        } catch (writeError) {
+          logger.warn(`Kiro写入结束响应失败: ${writeError.message}`);
+        }
       } catch (error) {
+        // 如果响应已结束，直接返回
+        if (responseEnded) {
+          return;
+        }
+        
         logger.error('Kiro生成响应失败:', error.message);
         
         // 尝试转储错误现场（跳过常见错误）
@@ -1120,22 +1150,26 @@ router.post('/v1/chat/completions', authenticateApiKey, async (req, res) => {
           await dumpErrorArtifacts(req.body, { model, messages, options }, null, error.message);
         }
 
-        res.write(`data: ${JSON.stringify({
-          id,
-          object: 'chat.completion.chunk',
-          created,
-          model,
-          choices: [{ index: 0, delta: { content: `\n\n错误: ${error.message}` }, finish_reason: null }]
-        })}\n\n`);
-        res.write(`data: ${JSON.stringify({
-          id,
-          object: 'chat.completion.chunk',
-          created,
-          model,
-          choices: [{ index: 0, delta: {}, finish_reason: 'stop' }]
-        })}\n\n`);
-        res.write('data: [DONE]\n\n');
-        res.end();
+        try {
+          res.write(`data: ${JSON.stringify({
+            id,
+            object: 'chat.completion.chunk',
+            created,
+            model,
+            choices: [{ index: 0, delta: { content: `\n\n错误: ${error.message}` }, finish_reason: null }]
+          })}\n\n`);
+          res.write(`data: ${JSON.stringify({
+            id,
+            object: 'chat.completion.chunk',
+            created,
+            model,
+            choices: [{ index: 0, delta: {}, finish_reason: 'stop' }]
+          })}\n\n`);
+          res.write('data: [DONE]\n\n');
+          res.end();
+        } catch (writeError) {
+          logger.warn(`Kiro写入错误响应失败: ${writeError.message}`);
+        }
       }
     } else {
       // 非流式响应
@@ -1218,9 +1252,20 @@ router.post('/v1/chat/completions', authenticateApiKey, async (req, res) => {
 
       let reasoningContent = ''; // 累积 reasoning_content
       let hasError = false; // 标记是否发生错误
+      let responseEnded = false; // 标记响应是否已结束
+      
+      // 监听响应关闭事件
+      res.on('close', () => {
+        responseEnded = true;
+      });
       
       try {
         await multiAccountClient.generateResponse(requestBody, async (data) => {
+          // 如果响应已结束，不再写入数据
+          if (responseEnded || hasError) {
+            return;
+          }
+          
           if (data.type === 'error') {
             // 尝试转储错误现场（跳过常见错误：Requested entity was not found, Prompt is too long, ILLEGAL_PROMPT）
             const skipDumpPatterns = ['Requested entity was not found', 'Prompt is too long', 'Internal'];
@@ -1231,24 +1276,36 @@ router.post('/v1/chat/completions', authenticateApiKey, async (req, res) => {
 
             // 处理错误：在流中发送错误信息
             hasError = true;
-            res.write(`data: ${JSON.stringify({
-              id,
-              object: 'chat.completion.chunk',
-              created,
-              model,
-              choices: [{ index: 0, delta: { content: `\n\n错误: ${data.content}` }, finish_reason: null }]
-            })}\n\n`);
-            res.write(`data: ${JSON.stringify({
-              id,
-              object: 'chat.completion.chunk',
-              created,
-              model,
-              choices: [{ index: 0, delta: {}, finish_reason: 'stop' }]
-            })}\n\n`);
-            res.write('data: [DONE]\n\n');
-            res.end();
+            try {
+              res.write(`data: ${JSON.stringify({
+                id,
+                object: 'chat.completion.chunk',
+                created,
+                model,
+                choices: [{ index: 0, delta: { content: `\n\n错误: ${data.content}` }, finish_reason: null }]
+              })}\n\n`);
+              res.write(`data: ${JSON.stringify({
+                id,
+                object: 'chat.completion.chunk',
+                created,
+                model,
+                choices: [{ index: 0, delta: {}, finish_reason: 'stop' }]
+              })}\n\n`);
+              res.write('data: [DONE]\n\n');
+              res.end();
+            } catch (writeError) {
+              logger.warn(`写入错误响应失败: ${writeError.message}`);
+            }
+            responseEnded = true;
             return;
-          } else if (data.type === 'tool_calls') {
+          }
+          
+          // 再次检查响应状态
+          if (responseEnded) {
+            return;
+          }
+          
+          if (data.type === 'tool_calls') {
             hasToolCall = true;
             // 累积工具调用内容用于token计算
             toolCallArgs += data.tool_calls.map(tc => tc.function?.name + (tc.function?.arguments || '')).join('');
@@ -1285,7 +1342,7 @@ router.post('/v1/chat/completions', authenticateApiKey, async (req, res) => {
         }, req.user.user_id, model, req.user, messages, account);
 
         // 如果已经发生错误并结束了响应，直接返回
-        if (hasError) {
+        if (hasError || responseEnded) {
           return;
         }
 
@@ -1326,7 +1383,7 @@ router.post('/v1/chat/completions', authenticateApiKey, async (req, res) => {
         res.end();
       } catch (error) {
         // 如果已经在回调中处理过错误并结束了响应，直接返回
-        if (hasError) {
+        if (hasError || responseEnded) {
           return;
         }
 
@@ -1343,22 +1400,26 @@ router.post('/v1/chat/completions', authenticateApiKey, async (req, res) => {
            await dumpErrorArtifacts(req.body, requestBody, error.responseText, error.message);
         }
 
-        res.write(`data: ${JSON.stringify({
-          id,
-          object: 'chat.completion.chunk',
-          created,
-          model,
-          choices: [{ index: 0, delta: { content: `\n\n错误: ${error.message}` }, finish_reason: null }]
-        })}\n\n`);
-        res.write(`data: ${JSON.stringify({
-          id,
-          object: 'chat.completion.chunk',
-          created,
-          model,
-          choices: [{ index: 0, delta: {}, finish_reason: 'stop' }]
-        })}\n\n`);
-        res.write('data: [DONE]\n\n');
-        res.end();
+        try {
+          res.write(`data: ${JSON.stringify({
+            id,
+            object: 'chat.completion.chunk',
+            created,
+            model,
+            choices: [{ index: 0, delta: { content: `\n\n错误: ${error.message}` }, finish_reason: null }]
+          })}\n\n`);
+          res.write(`data: ${JSON.stringify({
+            id,
+            object: 'chat.completion.chunk',
+            created,
+            model,
+            choices: [{ index: 0, delta: {}, finish_reason: 'stop' }]
+          })}\n\n`);
+          res.write('data: [DONE]\n\n');
+          res.end();
+        } catch (writeError) {
+          logger.warn(`写入错误响应失败: ${writeError.message}`);
+        }
       }
     } else {
       // 非流式响应：正常错误处理
@@ -1462,22 +1523,32 @@ const handleGeminiImageGeneration = async (req, res) => {
   res.setHeader('Connection', 'keep-alive');
   res.setHeader('X-Accel-Buffering', 'no'); // 禁用 nginx 缓冲
 
+  let responseEnded = false;
+
   // 心跳定时器，每30秒发送一个注释保持连接
   const heartbeatInterval = setInterval(() => {
+    if (responseEnded) {
+      return;
+    }
     try {
       res.write(': heartbeat\n\n');
     } catch (e) {
       // 忽略写入错误（连接可能已关闭）
+      responseEnded = true;
     }
   }, 30000);
 
   // 清理函数
   const cleanup = () => {
     clearInterval(heartbeatInterval);
+    responseEnded = true;
   };
 
   // 监听连接关闭
   req.on('close', cleanup);
+  res.on('close', () => {
+    responseEnded = true;
+  });
   
   let requestBody = null;
   
@@ -1488,14 +1559,20 @@ const handleGeminiImageGeneration = async (req, res) => {
     // 验证必需参数
     if (!contents || !Array.isArray(contents) || contents.length === 0) {
       cleanup();
-      res.write(`data: ${JSON.stringify({
-        error: {
-          code: 400,
-          message: 'contents是必需的且必须是非空数组',
-          status: 'INVALID_ARGUMENT'
+      if (!responseEnded) {
+        try {
+          res.write(`data: ${JSON.stringify({
+            error: {
+              code: 400,
+              message: 'contents是必需的且必须是非空数组',
+              status: 'INVALID_ARGUMENT'
+            }
+          })}\n\n`);
+          res.end();
+        } catch (writeError) {
+          logger.warn(`图片生成写入验证错误失败: ${writeError.message}`);
         }
-      })}\n\n`);
-      res.end();
+      }
       return;
     }
 
@@ -1524,14 +1601,20 @@ const handleGeminiImageGeneration = async (req, res) => {
     // 至少需要文本提示词或图片
     if (!prompt && images.length === 0) {
       cleanup();
-      res.write(`data: ${JSON.stringify({
-        error: {
-          code: 400,
-          message: '未找到有效的文本提示词或图片',
-          status: 'INVALID_ARGUMENT'
+      if (!responseEnded) {
+        try {
+          res.write(`data: ${JSON.stringify({
+            error: {
+              code: 400,
+              message: '未找到有效的文本提示词或图片',
+              status: 'INVALID_ARGUMENT'
+            }
+          })}\n\n`);
+          res.end();
+        } catch (writeError) {
+          logger.warn(`图片生成写入验证错误失败: ${writeError.message}`);
         }
-      })}\n\n`);
-      res.end();
+      }
       return;
     }
 
@@ -1566,8 +1649,14 @@ const handleGeminiImageGeneration = async (req, res) => {
     cleanup();
 
     // 返回 Gemini 格式的响应（通过 SSE data 事件）
-    res.write(`data: ${JSON.stringify(data)}\n\n`);
-    res.end();
+    if (!responseEnded) {
+      try {
+        res.write(`data: ${JSON.stringify(data)}\n\n`);
+        res.end();
+      } catch (writeError) {
+        logger.warn(`图片生成写入响应失败: ${writeError.message}`);
+      }
+    }
   } catch (error) {
     // 清理心跳定时器
     cleanup();
@@ -1583,15 +1672,21 @@ const handleGeminiImageGeneration = async (req, res) => {
       await dumpErrorArtifacts(req.body, requestBody, error.responseText, error.message);
     }
 
-    const statusCode = error.statusCode || 500;
-    res.write(`data: ${JSON.stringify({
-      error: {
-        code: statusCode,
-        message: error.message,
-        status: 'INTERNAL'
+    if (!responseEnded) {
+      try {
+        const statusCode = error.statusCode || 500;
+        res.write(`data: ${JSON.stringify({
+          error: {
+            code: statusCode,
+            message: error.message,
+            status: 'INTERNAL'
+          }
+        })}\n\n`);
+        res.end();
+      } catch (writeError) {
+        logger.warn(`图片生成写入错误响应失败: ${writeError.message}`);
       }
-    })}\n\n`);
-    res.end();
+    }
   }
 };
 
