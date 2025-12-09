@@ -1339,7 +1339,7 @@ router.post('/v1/chat/completions', authenticateApiKey, async (req, res) => {
               choices: [{ index: 0, delta: { content: data.content }, finish_reason: null }]
             })}\n\n`);
           }
-        }, req.user.user_id, model, req.user, messages, account);
+        }, req.user.user_id, model, req.user, account);
 
         // 如果已经发生错误并结束了响应，直接返回
         if (hasError || responseEnded) {
@@ -1442,7 +1442,7 @@ router.post('/v1/chat/completions', authenticateApiKey, async (req, res) => {
           } else {
             fullContent += data.content || '';
           }
-        }, req.user.user_id, model, req.user, messages, account);
+        }, req.user.user_id, model, req.user, account);
 
         // 如果有生成的图像,将其添加到响应内容中
         if (collectedImages.length > 0) {
