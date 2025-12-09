@@ -55,15 +55,11 @@ function extractImagesFromContent(content) {
 
   return result;
 }
-function handleUserMessage(extracted, antigravityMessages, enableThinking) {
+function handleUserMessage(extracted, antigravityMessages) {
   const parts = [];
   if (extracted.text) {
-    // 在thinking模式下,文本部分需要添加thought标记以避免API错误
-    if (enableThinking && extracted.images.length > 0) {
-      parts.push({ text: extracted.text, thought: false });
-    } else {
-      parts.push({ text: extracted.text });
-    }
+    // 非思考模型：直接放入文本，不添加任何标记
+    parts.push({ text: extracted.text });
   }
   parts.push(...extracted.images);
 
@@ -77,7 +73,7 @@ function handleUserMessage(extracted, antigravityMessages, enableThinking) {
     parts
   });
 }
-function handleAssistantMessage(message, antigravityMessages, isImageModel = false, enableThinking = false, signature = null) {
+function handleAssistantMessage(message, antigravityMessages, isImageModel = false) {
   const lastMessage = antigravityMessages[antigravityMessages.length - 1];
   const hasToolCalls = message.tool_calls && Array.isArray(message.tool_calls) && message.tool_calls.length > 0;
   const hasContent = message.content &&
@@ -95,10 +91,7 @@ function handleAssistantMessage(message, antigravityMessages, isImageModel = fal
       argsObj = {};
     }
 
-    // 修复：Gemini API 要求 functionCall parts 包含 thoughtSignature
-    // 注意：thoughtSignature 是 part 对象的属性，与 functionCall 同级，而不是 functionCall 内部的属性
-    // 正确格式：{ thoughtSignature: "...", functionCall: { name, args } }
-    // 错误格式：{ functionCall: { name, args, thoughtSignature: "..." } }
+    // 非思考模型：不添加 thoughtSignature
     const functionCallObj = {
       functionCall: {
         id: toolCall.id,
@@ -107,25 +100,11 @@ function handleAssistantMessage(message, antigravityMessages, isImageModel = fal
       }
     };
 
-    // 只有在启用 thinking 且有 signature 时才添加 thoughtSignature（与 functionCall 同级）
-    if (enableThinking && signature) {
-      functionCallObj.thoughtSignature = signature;
-    }
-
     return functionCallObj;
   }) : [];
 
   if (lastMessage?.role === "model" && hasToolCalls && !hasContent) {
-    // 修复：在合并 tool_calls 到现有 model 消息时，
-    // 如果启用 thinking 且有 signature，需要确保消息开头有思考块
-    if (enableThinking && signature && !lastMessage.parts.some(p => p.thought === true)) {
-      // 在开头插入一个带 signature 的思考块（使用占位符内容）
-      lastMessage.parts.unshift({
-        text: "...",
-        thought: true,
-        thoughtSignature: signature
-      });
-    }
+    // 非思考模型：直接合并 tool_calls，不添加思考块
     lastMessage.parts.push(...antigravityTools)
   } else {
     const parts = [];
@@ -141,72 +120,23 @@ function handleAssistantMessage(message, antigravityMessages, isImageModel = fal
           .join('');
       }
 
-      // 对于 image 模型，所有助手消息文本都标记为 thought: true
+      // 对于 image 模型，移除图片相关的markdown标记
       if (isImageModel) {
-        // 移除图片相关的markdown标记
         textContent = textContent.replace(/!\[.*?\]\(data:image\/[^)]+\)/g, '');
         textContent = textContent.replace(/\[图像生成完成[^\]]*\]/g, '');
         textContent = textContent.replace(/\n{3,}/g, '\n\n').trim();
 
         if (textContent) {
-          parts.push({ text: textContent, thought: true });
+          // 非思考模型：不添加 thought 标记
+          parts.push({ text: textContent });
         }
       } else {
-        // 非 image 模型的正常处理逻辑
-        // 提取并处理 <think>...</think> 标签内容
-        const thinkMatches = textContent.match(/<think>([\s\S]*?)<\/think>/g);
-        const hasThinkingContent = thinkMatches && thinkMatches.length > 0;
-
-        if (hasThinkingContent) {
-          for (const match of thinkMatches) {
-            const thinkContent = match.replace(/<\/?think>/g, '').trim();
-            if (thinkContent) {
-              parts.push({
-                text: thinkContent,
-                thought: true,
-                thoughtSignature: signature || ""
-              });
-            }
-          }
-        }
-
-        // 修复：如果启用 thinking 但没有思考内容，需要添加一个带 signature 的思考块
-        // Claude API 要求：当 thinking 启用时，所有 assistant 消息都必须以 thinking 块开头
-        // 这包括：1) 有 tool_calls 的消息  2) 纯文本消息（没有 tool_calls）
-        // 注意：使用占位符内容而不是空字符串，因为空字符串可能导致 Antigravity 转换问题
-        if (enableThinking && !hasThinkingContent && signature) {
-          parts.unshift({
-            text: "...",
-            thought: true,
-            thoughtSignature: signature
-          });
-        }
-
-        // 移除 <think>...</think> 标签及其内容，保留其他文本
-        textContent = textContent.replace(/<think>[\s\S]*?<\/think>/g, '');
-
-        // 清理多余的空行
-        textContent = textContent.replace(/\n{3,}/g, '\n\n').trim();
-
+        // 非思考模型：直接保留原始内容，包括 <think>...</think> 标签
+        // 不解析、不移除、不添加任何 thought/thoughtSignature 标记
         if (textContent) {
-          // 在thinking模式下的处理逻辑
-          if (enableThinking) {
-            parts.push({ text: textContent, thought: false });
-          } else {
-            parts.push({ text: textContent });
-          }
-        } else if (enableThinking && !hasThinkingContent && parts.length === 0 && !hasToolCalls) {
-          // 如果启用thinking但没有任何内容且没有tool_calls，添加一个空的thought: false标记
-          parts.push({ text: "", thought: false });
+          parts.push({ text: textContent });
         }
       }
-    } else if (enableThinking && hasToolCalls && signature) {
-      // 修复：如果没有内容但有 tool_calls，需要添加思考块（使用占位符内容）
-      parts.push({
-        text: "...",
-        thought: true,
-        thoughtSignature: signature
-      });
     }
 
     parts.push(...antigravityTools);
@@ -221,7 +151,7 @@ function handleAssistantMessage(message, antigravityMessages, isImageModel = fal
     })
   }
 }
-function handleToolCall(message, antigravityMessages, enableThinking = false, signature = null) {
+function handleToolCall(message, antigravityMessages) {
   let functionName = '';
   for (let i = antigravityMessages.length - 1; i >= 0; i--) {
     if (antigravityMessages[i].role === 'model') {
@@ -337,15 +267,18 @@ function isInvalidAssistantMessage(message) {
   return false;
 }
 
-function openaiMessageToAntigravity(openaiMessages, enableThinking, isCompletionModel = false, modelName = '', signature = null) {
+function openaiMessageToAntigravity(openaiMessages, isCompletionModel = false, modelName = '') {
   // 过滤掉无效的助手消息（只包含单个 "{" 字符的消息）
-  const filteredMessages = openaiMessages.filter(message => !isInvalidAssistantMessage(message));
+  // 同时过滤掉 system 消息（system 消息会单独处理放入 systemInstruction）
+  const filteredMessages = openaiMessages.filter(message =>
+    !isInvalidAssistantMessage(message) && message.role !== 'system'
+  );
 
   // 补全模型只需要最后一条用户消息作为提示
   if (isCompletionModel) {
-    // 将所有消息合并为一个提示词
+    // 将所有消息合并为一个提示词（补全模型仍然包含 system 消息）
     let prompt = '';
-    for (const message of filteredMessages) {
+    for (const message of openaiMessages) {
       if (message.role === 'system') {
         prompt += message.content + '\n\n';
       } else if (message.role === 'user') {
@@ -365,46 +298,57 @@ function openaiMessageToAntigravity(openaiMessages, enableThinking, isCompletion
   const isImageModel = modelName.endsWith('-image');
 
   for (const message of filteredMessages) {
-    if (message.role === "user" || message.role === "system") {
+    if (message.role === "user") {
       const extracted = extractImagesFromContent(message.content);
-      handleUserMessage(extracted, antigravityMessages, enableThinking);
+      handleUserMessage(extracted, antigravityMessages);
     } else if (message.role === "assistant") {
-      handleAssistantMessage(message, antigravityMessages, isImageModel, enableThinking, signature);
+      handleAssistantMessage(message, antigravityMessages, isImageModel);
     } else if (message.role === "tool") {
-      handleToolCall(message, antigravityMessages, enableThinking, signature);
+      handleToolCall(message, antigravityMessages);
     }
   }
 
-  return antigravityMessages;
-}
-/**
- * 检查消息列表中最后一条助手消息是否包含思考内容
- * @param {Array} messages - OpenAI 格式的消息数组
- * @returns {boolean} 如果最后一条助手消息有思考内容返回 true，否则返回 false
- */
-function hasThinkingContentInLastAssistant(messages) {
-  // 找到最后一条助手消息
-  for (let i = messages.length - 1; i >= 0; i--) {
-    if (messages[i].role === 'assistant') {
-      const message = messages[i];
-      const content = typeof message.content === 'string'
-        ? message.content
-        : (Array.isArray(message.content)
-            ? message.content.filter(c => c.type === 'text').map(c => c.text).join('')
-            : '');
-      
-      // 检查是否有 <think>...</think> 标签
-      return /<think>[\s\S]*?<\/think>/.test(content);
+  // 清理孤立的 functionResponse（没有对应 functionCall 的）
+  // 首先收集所有 functionCall 的 id
+  const functionCallIds = new Set();
+  for (const msg of antigravityMessages) {
+    if (msg.role === 'model' && msg.parts) {
+      for (const part of msg.parts) {
+        if (part.functionCall && part.functionCall.id) {
+          functionCallIds.add(part.functionCall.id);
+        }
+      }
     }
   }
-  // 没有助手消息，返回 true（不需要禁用 thinking）
-  return true;
-}
 
-function generateGenerationConfig(parameters, enableThinking, actualModelName, isNonChatModel = false, forceDisableThinking = false) {
-  // 如果强制禁用 thinking，则覆盖 enableThinking
-  const effectiveEnableThinking = forceDisableThinking ? false : enableThinking;
-  
+  // 然后移除没有对应 functionCall 的 functionResponse
+  for (const msg of antigravityMessages) {
+    if (msg.role === 'user' && msg.parts) {
+      msg.parts = msg.parts.filter(part => {
+        if (part.functionResponse && part.functionResponse.id) {
+          // 如果找不到对应的 functionCall，移除这个 part
+          if (!functionCallIds.has(part.functionResponse.id)) {
+            logger.info(`移除孤立的 functionResponse: id=${part.functionResponse.id}`);
+            return false;
+          }
+        }
+        return true;
+      });
+    }
+  }
+
+  // 移除空的 user 消息（所有 parts 都被移除的情况）
+  const cleanedMessages = antigravityMessages.filter(msg => {
+    if (msg.role === 'user' && msg.parts && msg.parts.length === 0) {
+      logger.info('移除空的 user 消息');
+      return false;
+    }
+    return true;
+  });
+
+  return cleanedMessages;
+}
+function generateGenerationConfig(parameters, enableThinking, actualModelName, isNonChatModel = false) {
   // thinking 模型的 max_tokens 最小值为 2048
   let maxOutputTokens = parameters.max_tokens ?? config.defaults.max_tokens;
   if (effectiveEnableThinking && maxOutputTokens < 2048) {
@@ -565,12 +509,6 @@ function convertOpenAIToolsToAntigravity(openaiTools) {
   });
 }
 
-// 注意：injectSignatures 函数已废弃，signature 现在在消息转换时直接注入
-// 保留空函数以保持向后兼容
-function injectSignatures(contents, signatures, enableThinking = false) {
-  return;
-}
-
 async function generateRequestBody(openaiMessages, modelName, parameters, openaiTools, user_id = null, account = null) {
   // Gemini 2.5 Flash Thinking 路由到 Gemini 2.5 Flash
   let actualModelName = modelName;
@@ -578,11 +516,20 @@ async function generateRequestBody(openaiMessages, modelName, parameters, openai
     actualModelName = 'gemini-2.5-flash';
   }
 
-  const enableThinking = modelName.endsWith('-thinking') ||
+  let enableThinking = modelName.endsWith('-thinking') ||
     modelName === 'gemini-2.5-pro' ||
     modelName.startsWith('gemini-3-pro-') ||
     modelName === "rev19-uic3-1p" ||
     modelName === "gpt-oss-120b-medium"
+
+  // 检查最后一条消息的 role 是否为 tool
+  // 如果是 tool，则禁用 thinking（设置 includeThoughts 为 false 并移除 thinkingBudget）
+  const lastMessage = openaiMessages[openaiMessages.length - 1];
+  const isLastMessageTool = lastMessage && lastMessage.role === 'tool';
+  if (isLastMessageTool) {
+    logger.info('最后一条消息为 tool，禁用 thinking');
+    enableThinking = false;
+  }
 
   // 用于生成配置的基础模型名（去掉-thinking后缀用于某些配置判断）
   const baseModelName = actualModelName.endsWith('-thinking') ? actualModelName.slice(0, -9) : actualModelName;
@@ -593,20 +540,6 @@ async function generateRequestBody(openaiMessages, modelName, parameters, openai
 
   if (isChatModel) {
     throw new Error(`Unsupported completion model: ${baseModelName}`);
-  }
-
-  // 先检索存储的 signature（需要在判断是否禁用 thinking 之前）
-  let storedSignature = null;
-  if (enableThinking && user_id && !isImageModel) {
-    try {
-      const { default: signatureService } = await import('../services/signature.service.js');
-      // 检查是否有 tool 交互
-      if (signatureService.hasToolInteraction(openaiMessages)) {
-        storedSignature = await signatureService.retrieveSignature(user_id);
-      }
-    } catch (error) {
-      logger.warn('检索 signature 失败:', error.message);
-    }
   }
 
   // 检查是否需要强制禁用 thinking
@@ -632,9 +565,13 @@ async function generateRequestBody(openaiMessages, modelName, parameters, openai
   // 标准对话模型使用标准格式，传入 forceDisableThinking 参数
   const generationConfig = generateGenerationConfig(parameters, enableThinking, baseModelName, false, forceDisableThinking);
 
-  // 传入 signature 参数，在消息转换时直接注入
-  // 使用 effectiveEnableThinking 来决定是否启用 thinking 相关的消息处理
-  const contents = openaiMessageToAntigravity(openaiMessages, effectiveEnableThinking, false, baseModelName, storedSignature);
+  // 如果最后一条消息是 tool，移除 thinkingBudget 字段
+  if (isLastMessageTool && generationConfig.thinkingConfig) {
+    delete generationConfig.thinkingConfig.thinkingBudget;
+  }
+
+  // 消息转换
+  const contents = openaiMessageToAntigravity(openaiMessages, false, baseModelName);
 
   // 优先使用账号的 project_id_0，如果不存在则随机生成
   let projectId = generateProjectId();
@@ -646,6 +583,30 @@ async function generateRequestBody(openaiMessages, modelName, parameters, openai
     }
   }
 
+  // 提取用户传入的 system 消息，合并为 systemInstruction
+  // 如果用户没有传入 system 消息，则使用配置文件中的默认值
+  const systemMessages = openaiMessages.filter(msg => msg.role === 'system');
+  let systemInstructionText = '';
+  
+  if (systemMessages.length > 0) {
+    // 合并所有 system 消息的内容
+    systemInstructionText = systemMessages.map(msg => {
+      if (typeof msg.content === 'string') {
+        return msg.content;
+      } else if (Array.isArray(msg.content)) {
+        // 处理 multimodal 格式的 system 消息（只提取文本部分）
+        return msg.content
+          .filter(item => item.type === 'text')
+          .map(item => item.text)
+          .join('');
+      }
+      return '';
+    }).join('\n\n');
+  } else {
+    // 如果用户没有传入 system 消息，使用配置文件中的默认值
+    systemInstructionText = config.systemInstruction || '';
+  }
+
   const requestBody = {
     project: projectId,
     requestId: generateRequestId(),
@@ -655,11 +616,12 @@ async function generateRequestBody(openaiMessages, modelName, parameters, openai
       sessionId: generateSessionId(),
       systemInstruction: {
         role: "user",
-        parts: [{ text: config.systemInstruction }]
+        parts: [{ text: systemInstructionText }]
       }
     },
     model: actualModelName,
-    userAgent: "antigravity"
+    userAgent: "antigravity",
+    requestType: "agent"
   };
 
   if (openaiTools && openaiTools.length > 0) {
@@ -811,6 +773,5 @@ export {
   generateProjectId,
   generateRequestBody,
   generateImageRequestBody,
-  injectSignatures,
   dumpErrorArtifacts
 }

@@ -3,7 +3,6 @@ import logger from '../utils/logger.js';
 import accountService from '../services/account.service.js';
 import quotaService from '../services/quota.service.js';
 import oauthService from '../services/oauth.service.js';
-import signatureService from '../services/signature.service.js';
 
 /**
  * 自定义API错误类，包含HTTP状态码
@@ -169,12 +168,11 @@ class MultiAccountClient {
    * @param {string} user_id - 用户ID
    * @param {string} model_name - 模型名称
    * @param {Object} user - 用户对象
-   * @param {Array} originalMessages - 原始 OpenAI 格式的消息数组（用于 signature 管理）
    * @param {Object} account - 账号对象（可选，如果不提供则自动获取）
    * @param {Array} excludeCookieIds - 要排除的cookie_id列表（用于重试时排除已失败的账号）
    * @param {number} retryCount - 429错误重试计数（最多3次）
    */
-  async generateResponse(requestBody, callback, user_id, model_name, user, originalMessages = [], account = null, excludeCookieIds = [], retryCount = 0) {
+  async generateResponse(requestBody, callback, user_id, model_name, user, account = null, excludeCookieIds = [], retryCount = 0) {
     // 如果没有提供 account，则获取一个
     if (!account) {
       account = await this.getAvailableAccount(user_id, model_name, user, excludeCookieIds);
@@ -271,7 +269,7 @@ class MultiAccountClient {
               }
               
               // 递归调用，使用新账号重试
-              return await this.generateResponse(requestBody, callback, user_id, model_name, user, originalMessages, newAccount, newExcludeList);
+              return await this.generateResponse(requestBody, callback, user_id, model_name, user, newAccount, newExcludeList);
             } catch (retryError) {
               // 如果没有更多可用账号，返回配额耗尽错误
               logger.error(`所有账号配额已耗尽，无法重试: ${retryError.message}`);
@@ -304,7 +302,7 @@ class MultiAccountClient {
               }
               
               // 递归调用，使用新账号重试
-              return await this.generateResponse(requestBody, callback, user_id, model_name, user, originalMessages, newAccount, newExcludeList);
+              return await this.generateResponse(requestBody, callback, user_id, model_name, user, newAccount, newExcludeList);
             } catch (retryError) {
               // 如果没有更多可用账号，返回错误
               logger.error(`所有账号都不可用，无法重试: ${retryError.message}`);
@@ -353,7 +351,7 @@ class MultiAccountClient {
             }
             
             // 递归调用，使用新账号重试，增加重试计数
-            return await this.generateResponse(requestBody, callback, user_id, model_name, user, originalMessages, newAccount, newExcludeList, retryCount + 1);
+            return await this.generateResponse(requestBody, callback, user_id, model_name, user, newAccount, newExcludeList, retryCount + 1);
           } catch (retryError) {
             // 如果没有更多可用账号，返回配额耗尽错误
             logger.error(`所有账号配额已耗尽，无法重试: ${retryError.message}`);
@@ -387,8 +385,6 @@ class MultiAccountClient {
     let toolCalls = [];
     let generatedImages = [];
     let buffer = ''; // 用于处理跨chunk的JSON
-    let collectedSignature = null; // 只收集第一个 signature
-    let hasToolCalls = false; // 标记是否有 tool calls
     let collectedParts = []; // 收集所有原始 parts 用于日志打印
     let fullTextContent = ''; // 累积完整的文本内容
     let lastFinishReason = null; // 记录最后的 finishReason
@@ -439,15 +435,6 @@ class MultiAccountClient {
               collectedParts.push(partCopy);
             }
             
-            // 只提取第一个 signature
-            if (!collectedSignature) {
-              const sig = signatureService.extractSignatureFromResponse(parts);
-              if (sig) {
-                collectedSignature = sig;
-                logger.info(`提取到 thought signature: ${sig.substring(0, 20)}...`);
-              }
-            }
-            
             for (const part of parts) {
               if (part.thought === true) {
                 // Gemini 的思考内容转换为 OpenAI 兼容的 reasoning_content 格式
@@ -475,7 +462,6 @@ class MultiAccountClient {
                   }
                 });
               } else if (part.functionCall) {
-                hasToolCalls = true;
                 toolCalls.push({
                   id: part.functionCall.id,
                   type: 'function',
@@ -497,15 +483,6 @@ class MultiAccountClient {
         } catch (e) {
           logger.warn(`JSON解析失败: ${e.message}`);
         }
-      }
-    }
-
-    // 只有当有 tool calls 时才存储 signature
-    if (collectedSignature && hasToolCalls && user_id) {
-      try {
-        await signatureService.storeSignature(user_id, collectedSignature);
-      } catch (error) {
-        logger.error('存储 thought signature 失败:', error.message);
       }
     }
 
