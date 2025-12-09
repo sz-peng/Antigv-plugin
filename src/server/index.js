@@ -88,3 +88,20 @@ const shutdown = async () => {
 
 process.on('SIGINT', shutdown);
 process.on('SIGTERM', shutdown);
+
+// 全局未捕获异常处理器 - 防止程序崩溃
+process.on('uncaughtException', (error) => {
+  logger.error('未捕获的异常:', error.message, error.stack);
+  // 不退出进程，让服务继续运行
+  // 但如果是严重错误，可能需要重启
+  if (error.code === 'ECONNRESET' || error.code === 'EPIPE' || error.code === 'ERR_STREAM_WRITE_AFTER_END') {
+    // 这些是连接相关的错误，通常是客户端断开连接导致的，可以安全忽略
+    logger.warn('连接相关错误，已忽略:', error.code);
+  }
+});
+
+// 全局未处理的Promise拒绝处理器
+process.on('unhandledRejection', (reason, promise) => {
+  logger.error('未处理的Promise拒绝:', reason);
+  // 不退出进程，让服务继续运行
+});

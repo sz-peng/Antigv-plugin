@@ -808,6 +808,7 @@ router.post('/v1/kiro/chat/completions', authenticateApiKey, async (req, res) =>
     let fullContent = ''; // 累积输出内容用于计算token
     let toolCallArgs = ''; // 累积工具调用参数用于计算token
     let toolCallIndex = 0; // 跟踪工具调用索引
+    let responseEnded = false; // 标记响应是否已结束
 
     try {
       // 先尝试获取账号，如果失败则返回错误状态码
@@ -816,101 +817,130 @@ router.post('/v1/kiro/chat/completions', authenticateApiKey, async (req, res) =>
       res.setHeader('Cache-Control', 'no-cache');
       res.setHeader('Connection', 'keep-alive');
       
+      // 监听响应关闭事件
+      res.on('close', () => {
+        responseEnded = true;
+      });
+      
       await kiroClient.generateResponse(messages, model, (data) => {
-        if (data.type === 'tool_call_start') {
-          // OpenAI 流式格式：首次发送工具调用（包含 id, type, function.name）
-          hasToolCall = true;
-          const toolCalls = data.tool_calls.map((tc, idx) => ({
-            index: tc.index,  // 使用从 kiro_client 传来的正确索引
-            id: tc.id,
-            type: 'function',
-            function: {
-              name: tc.function.name,
-              arguments: ''
-            }
-          }));
-          // 累积工具名称用于token计算
-          toolCallArgs += data.tool_calls.map(tc => tc.function.name).join('');
-          const chunk = {
-            id,
-            object: 'chat.completion.chunk',
-            created,
-            model,
-            choices: [{ index: 0, delta: { tool_calls: toolCalls }, finish_reason: null }]
-          };
-          res.write(`data: ${JSON.stringify(chunk)}\n\n`);
-        } else if (data.type === 'tool_call_delta') {
-          // OpenAI 流式格式：后续发送工具调用参数
-          hasToolCall = true;
-          // 累积工具参数用于token计算
-          toolCallArgs += data.delta || '';
-          const chunk = {
-            id,
-            object: 'chat.completion.chunk',
-            created,
-            model,
-            choices: [{
-              index: 0,
-              delta: {
-                tool_calls: [{
-                  index: data.tool_call_index,  // 使用正确的工具调用索引
-                  id: data.tool_call_id,  // 添加工具调用ID
-                  function: {
-                    arguments: data.delta
-                  }
-                }]
-              },
-              finish_reason: null
-            }]
-          };
-          res.write(`data: ${JSON.stringify(chunk)}\n\n`);
-        } else if (data.type === 'tool_calls') {
-          // 兼容旧格式：一次性发送完整的工具调用
-          hasToolCall = true;
-          // 累积工具调用内容用于token计算
-          toolCallArgs += data.tool_calls.map(tc => tc.function?.name + (tc.function?.arguments || '')).join('');
-          const chunk = {
-            id,
-            object: 'chat.completion.chunk',
-            created,
-            model,
-            choices: [{ index: 0, delta: { tool_calls: data.tool_calls }, finish_reason: null }]
-          };
-          res.write(`data: ${JSON.stringify(chunk)}\n\n`);
-        } else if (data.type === 'text') {
-          fullContent += data.content; // 累积内容
-          const chunk = {
-            id,
-            object: 'chat.completion.chunk',
-            created,
-            model,
-            choices: [{ index: 0, delta: { content: data.content }, finish_reason: null }]
-          };
-          res.write(`data: ${JSON.stringify(chunk)}\n\n`);
+        // 如果响应已结束，不再写入数据
+        if (responseEnded) {
+          return;
+        }
+        
+        try {
+          if (data.type === 'tool_call_start') {
+            // OpenAI 流式格式：首次发送工具调用（包含 id, type, function.name）
+            hasToolCall = true;
+            const toolCalls = data.tool_calls.map((tc, idx) => ({
+              index: tc.index,  // 使用从 kiro_client 传来的正确索引
+              id: tc.id,
+              type: 'function',
+              function: {
+                name: tc.function.name,
+                arguments: ''
+              }
+            }));
+            // 累积工具名称用于token计算
+            toolCallArgs += data.tool_calls.map(tc => tc.function.name).join('');
+            const chunk = {
+              id,
+              object: 'chat.completion.chunk',
+              created,
+              model,
+              choices: [{ index: 0, delta: { tool_calls: toolCalls }, finish_reason: null }]
+            };
+            res.write(`data: ${JSON.stringify(chunk)}\n\n`);
+          } else if (data.type === 'tool_call_delta') {
+            // OpenAI 流式格式：后续发送工具调用参数
+            hasToolCall = true;
+            // 累积工具参数用于token计算
+            toolCallArgs += data.delta || '';
+            const chunk = {
+              id,
+              object: 'chat.completion.chunk',
+              created,
+              model,
+              choices: [{
+                index: 0,
+                delta: {
+                  tool_calls: [{
+                    index: data.tool_call_index,  // 使用正确的工具调用索引
+                    id: data.tool_call_id,  // 添加工具调用ID
+                    function: {
+                      arguments: data.delta
+                    }
+                  }]
+                },
+                finish_reason: null
+              }]
+            };
+            res.write(`data: ${JSON.stringify(chunk)}\n\n`);
+          } else if (data.type === 'tool_calls') {
+            // 兼容旧格式：一次性发送完整的工具调用
+            hasToolCall = true;
+            // 累积工具调用内容用于token计算
+            toolCallArgs += data.tool_calls.map(tc => tc.function?.name + (tc.function?.arguments || '')).join('');
+            const chunk = {
+              id,
+              object: 'chat.completion.chunk',
+              created,
+              model,
+              choices: [{ index: 0, delta: { tool_calls: data.tool_calls }, finish_reason: null }]
+            };
+            res.write(`data: ${JSON.stringify(chunk)}\n\n`);
+          } else if (data.type === 'text') {
+            fullContent += data.content; // 累积内容
+            const chunk = {
+              id,
+              object: 'chat.completion.chunk',
+              created,
+              model,
+              choices: [{ index: 0, delta: { content: data.content }, finish_reason: null }]
+            };
+            res.write(`data: ${JSON.stringify(chunk)}\n\n`);
+          }
+        } catch (writeError) {
+          logger.warn(`Kiro写入响应失败: ${writeError.message}`);
+          responseEnded = true;
         }
       }, req.user.user_id, options);
+
+      // 如果响应已结束，直接返回
+      if (responseEnded) {
+        return;
+      }
 
       // 计算输出token数（包括文本内容和工具调用参数）
       const completionTokens = countStringTokens(fullContent + toolCallArgs, model);
       const totalTokens = promptTokens + completionTokens;
 
       // 发送带usage的finish chunk
-      const finishChunk = {
-        id,
-        object: 'chat.completion.chunk',
-        created,
-        model,
-        choices: [{ index: 0, delta: {}, finish_reason: hasToolCall ? 'tool_calls' : 'stop' }],
-        usage: {
-          prompt_tokens: promptTokens,
-          completion_tokens: completionTokens,
-          total_tokens: totalTokens
-        }
-      };
-      res.write(`data: ${JSON.stringify(finishChunk)}\n\n`);
-      res.write('data: [DONE]\n\n');
-      res.end();
+      try {
+        const finishChunk = {
+          id,
+          object: 'chat.completion.chunk',
+          created,
+          model,
+          choices: [{ index: 0, delta: {}, finish_reason: hasToolCall ? 'tool_calls' : 'stop' }],
+          usage: {
+            prompt_tokens: promptTokens,
+            completion_tokens: completionTokens,
+            total_tokens: totalTokens
+          }
+        };
+        res.write(`data: ${JSON.stringify(finishChunk)}\n\n`);
+        res.write('data: [DONE]\n\n');
+        res.end();
+      } catch (writeError) {
+        logger.warn(`Kiro写入结束响应失败: ${writeError.message}`);
+      }
     } catch (error) {
+      // 如果响应已结束，直接返回
+      if (responseEnded) {
+        return;
+      }
+      
       logger.error('Kiro生成响应失败:', error.message);
       
       // 根据错误类型返回适当的状态码
@@ -938,22 +968,26 @@ router.post('/v1/kiro/chat/completions', authenticateApiKey, async (req, res) =>
         });
       } else {
         // 如果已经开始发送流式数据，则在流中发送错误信息
-        res.write(`data: ${JSON.stringify({
-          id,
-          object: 'chat.completion.chunk',
-          created,
-          model,
-          choices: [{ index: 0, delta: { content: `\n\n错误: ${errorMessage}` }, finish_reason: null }]
-        })}\n\n`);
-        res.write(`data: ${JSON.stringify({
-          id,
-          object: 'chat.completion.chunk',
-          created,
-          model,
-          choices: [{ index: 0, delta: {}, finish_reason: 'stop' }]
-        })}\n\n`);
-        res.write('data: [DONE]\n\n');
-        res.end();
+        try {
+          res.write(`data: ${JSON.stringify({
+            id,
+            object: 'chat.completion.chunk',
+            created,
+            model,
+            choices: [{ index: 0, delta: { content: `\n\n错误: ${errorMessage}` }, finish_reason: null }]
+          })}\n\n`);
+          res.write(`data: ${JSON.stringify({
+            id,
+            object: 'chat.completion.chunk',
+            created,
+            model,
+            choices: [{ index: 0, delta: {}, finish_reason: 'stop' }]
+          })}\n\n`);
+          res.write('data: [DONE]\n\n');
+          res.end();
+        } catch (writeError) {
+          logger.warn(`Kiro写入错误响应失败: ${writeError.message}`);
+        }
       }
     }
   } else {
