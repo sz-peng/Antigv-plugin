@@ -106,9 +106,10 @@ class KiroClient {
           res.on('end', () => {
             logger.error(`[${requestId}] API错误: ${res.statusCode} - ${errorBody}`);
             
-            if (res.statusCode === 403) {
+            // 402 或 403 错误时自动禁用账号
+            if (res.statusCode === 402 || res.statusCode === 403) {
               kiroAccountService.updateAccountStatus(account.account_id, 0);
-              logger.warn(`Kiro账号已禁用: account_id=${account.account_id}`);
+              logger.warn(`Kiro账号已禁用(${res.statusCode}): account_id=${account.account_id}`);
             }
             
             reject(new Error(`错误: ${res.statusCode} ${errorBody}`));

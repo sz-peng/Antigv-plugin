@@ -55,11 +55,19 @@ function extractImagesFromContent(content) {
 
   return result;
 }
+
+function convertThinkToThoughtTags(text) {
+  if (!text || typeof text !== 'string') {
+    return text;
+  }
+  return text.replace(/<think>/g, '<THOUGHT>').replace(/<\/think>/g, '</THOUGHT>');
+}
+
 function handleUserMessage(extracted, antigravityMessages) {
   const parts = [];
   if (extracted.text) {
-    // 非思考模型：直接放入文本，不添加任何标记
-    parts.push({ text: extracted.text });
+    const processedText = convertThinkToThoughtTags(extracted.text);
+    parts.push({ text: processedText });
   }
   parts.push(...extracted.images);
 
@@ -137,10 +145,10 @@ function handleAssistantMessage(message, antigravityMessages, isImageModel = fal
           parts.push({ text: textContent });
         }
       } else {
-        // 非思考模型：直接保留原始内容，包括 <think>...</think> 标签
-        // 不解析、不移除、不添加任何 thought/thoughtSignature 标记
+        // 将 <think></think> 标签替换为 <THOUGHT></THOUGHT> 标签
         if (textContent) {
-          parts.push({ text: textContent });
+          const processedText = convertThinkToThoughtTags(textContent);
+          parts.push({ text: processedText });
         }
       }
     }
