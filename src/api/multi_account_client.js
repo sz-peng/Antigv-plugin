@@ -1,4 +1,4 @@
-import config from '../config/config.js';
+import config, { getApiEndpoint, getEndpointCount } from '../config/config.js';
 import logger from '../utils/logger.js';
 import accountService from '../services/account.service.js';
 import quotaService from '../services/quota.service.js';
@@ -171,8 +171,10 @@ class MultiAccountClient {
    * @param {Object} account - 账号对象（可选，如果不提供则自动获取）
    * @param {Array} excludeCookieIds - 要排除的cookie_id列表（用于重试时排除已失败的账号）
    * @param {number} retryCount - 429错误重试计数（最多3次）
+   * @param {number} endpointIndex - 当前使用的API端点索引（用于403重试）
+   * @param {string|null} firstError403Type - 第一次403错误的类型（用于决定是否禁用账号）
    */
-  async generateResponse(requestBody, callback, user_id, model_name, user, account = null, excludeCookieIds = [], retryCount = 0) {
+  async generateResponse(requestBody, callback, user_id, model_name, user, account = null, excludeCookieIds = [], retryCount = 0, endpointIndex = 0, firstError403Type = null) {
     // 如果没有提供 account，则获取一个
     if (!account) {
       account = await this.getAvailableAccount(user_id, model_name, user, excludeCookieIds);
@@ -211,15 +213,19 @@ class MultiAccountClient {
       requestBody.project = account.project_id_0;
     }
     
-    const url = config.api.url;
+    // 获取当前端点配置
+    const endpoint = getApiEndpoint(endpointIndex);
+    const url = endpoint.url;
     
     const requestHeaders = {
-      'Host': config.api.host,
+      'Host': endpoint.host,
       'User-Agent': config.api.userAgent,
       'Authorization': `Bearer ${account.access_token}`,
       'Content-Type': 'application/json',
       'Accept-Encoding': 'gzip'
     };
+    
+    logger.info(`使用API端点[${endpointIndex}]: ${endpoint.host}`);
     
     let response;
     
@@ -245,17 +251,34 @@ class MultiAccountClient {
         const responseText = await response.text();
         
         if (response.status === 403) {
-          // 检查是否是 "The caller does not have permission" 错误
-          // 这种错误通常是临时性的，不应该禁用账号，直接返回错误
-          if (responseText.includes('The caller does not have permission') || responseText.includes('PERMISSION_DENIED')) {
-            logger.warn(`[403错误] 调用者没有权限(临时性错误)，不禁用账号，直接返回错误: cookie_id=${account.cookie_id}`);
-            callback({ type: 'error', content: 'PERMISSION_DENIED', upstreamResponse: responseText, upstreamRequest: requestBody });
-            throw new ApiError('PERMISSION_DENIED', 403, responseText);
-          }
+          // 判断是否是 "The caller does not have permission" 错误
+          const isPermissionDenied = responseText.includes('The caller does not have permission');
           
-          // 其他403错误，禁用账号
-          logger.warn(`账号没有使用权限(403)，已禁用: cookie_id=${account.cookie_id}`);
-          await accountService.updateAccountStatus(account.cookie_id, 0);
+          // 记录第一次403错误的类型（只在第一次请求时记录）
+          const currentFirstError403Type = firstError403Type === null
+            ? (isPermissionDenied ? 'PERMISSION_DENIED' : '403')
+            : firstError403Type;
+          
+          // 所有403错误都尝试切换端点重试
+          const nextEndpointIndex = endpointIndex + 1;
+          const totalEndpoints = getEndpointCount();
+          
+          if (nextEndpointIndex < totalEndpoints) {
+            // 还有其他端点可以尝试
+            logger.warn(`[403错误] 端点[${endpointIndex}]返回403，尝试切换到端点[${nextEndpointIndex}]: cookie_id=${account.cookie_id}`);
+            return await this.generateResponse(requestBody, callback, user_id, model_name, user, account, excludeCookieIds, retryCount, nextEndpointIndex, currentFirstError403Type);
+          } else {
+            // 所有端点都返回403
+            // 只有当第一次错误不是 PERMISSION_DENIED 时才禁用账号
+            if (currentFirstError403Type !== 'PERMISSION_DENIED') {
+              logger.warn(`[403错误] 所有${totalEndpoints}个端点都返回403，禁用账号: cookie_id=${account.cookie_id}`);
+              await accountService.updateAccountStatus(account.cookie_id, 0);
+            } else {
+              logger.warn(`[403错误] 所有${totalEndpoints}个端点都返回403，但第一次错误是PERMISSION_DENIED，不禁用账号: cookie_id=${account.cookie_id}`);
+            }
+            callback({ type: 'error', content: 'ALL_ENDPOINTS_403', upstreamResponse: responseText, upstreamRequest: requestBody });
+            throw new ApiError('ALL_ENDPOINTS_403', 403, responseText);
+          }
         }
         
         // 检查是否是400错误（可能是账号问题）
@@ -544,9 +567,10 @@ class MultiAccountClient {
   /**
    * 获取可用模型列表
    * @param {string} user_id - 用户ID
+   * @param {number} endpointIndex - 当前使用的API端点索引（用于403重试）
    * @returns {Promise<Object>} 模型列表
    */
-  async getAvailableModels(user_id) {
+  async getAvailableModels(user_id, endpointIndex = 0) {
     // 获取任意一个可用账号
     const accounts = await accountService.getAvailableAccounts(user_id);
     
@@ -573,16 +597,20 @@ class MultiAccountClient {
       }
     }
 
-    const modelsUrl = config.api.modelsUrl;
+    // 获取当前端点配置
+    const endpoint = getApiEndpoint(endpointIndex);
+    const modelsUrl = endpoint.modelsUrl;
     
     const requestHeaders = {
-      'Host': config.api.host,
+      'Host': endpoint.host,
       'User-Agent': config.api.userAgent,
       'Authorization': `Bearer ${account.access_token}`,
       'Content-Type': 'application/json',
       'Accept-Encoding': 'gzip'
     };
     const requestBody = {};
+    
+    logger.info(`[获取模型列表] 使用API端点[${endpointIndex}]: ${endpoint.host}`);
     
     let response;
     let data;
@@ -593,6 +621,22 @@ class MultiAccountClient {
         headers: requestHeaders,
         body: JSON.stringify(requestBody)
       });
+      
+      if (response.status === 403) {
+        // 403错误，尝试切换端点重试
+        const nextEndpointIndex = endpointIndex + 1;
+        const totalEndpoints = getEndpointCount();
+        
+        if (nextEndpointIndex < totalEndpoints) {
+          logger.warn(`[获取模型列表-403错误] 端点[${endpointIndex}]返回403，尝试切换到端点[${nextEndpointIndex}]`);
+          return await this.getAvailableModels(user_id, nextEndpointIndex);
+        } else {
+          // 所有端点都返回403，禁用账号
+          logger.warn(`[获取模型列表-403错误] 所有${totalEndpoints}个端点都返回403，禁用账号: cookie_id=${account.cookie_id}`);
+          await accountService.updateAccountStatus(account.cookie_id, 0);
+          throw new ApiError('All endpoints returned 403', 403, 'All endpoints returned 403');
+        }
+      }
       
       data = await response.json();
       
@@ -622,12 +666,13 @@ class MultiAccountClient {
   }
 
   /**
-   * 刷新cookie的quota（实时获取，使用两个projectId并叠加配额）
+   * 刷新cookie的quota（实时获取，使用默认端点）
    * @param {string} cookie_id - Cookie ID
    * @param {string} access_token - Access Token
    * @returns {Promise<void>}
    */
   async refreshCookieQuota(cookie_id, access_token) {
+    // 使用默认端点配置
     const modelsUrl = config.api.modelsUrl;
     
     try {
@@ -705,9 +750,11 @@ class MultiAccountClient {
    * @param {Object} account - 账号对象（可选，如果不提供则自动获取）
    * @param {Array} excludeCookieIds - 要排除的cookie_id列表（用于重试时排除已失败的账号）
    * @param {number} retryCount - 429错误重试计数（最多3次）
+   * @param {number} endpointIndex - 当前使用的API端点索引（用于403重试）
+   * @param {string|null} firstError403Type - 第一次403错误的类型（用于决定是否禁用账号）
    * @returns {Promise<Object>} 图片生成响应
    */
-  async generateImage(requestBody, user_id, model_name, user, account = null, excludeCookieIds = [], retryCount = 0) {
+  async generateImage(requestBody, user_id, model_name, user, account = null, excludeCookieIds = [], retryCount = 0, endpointIndex = 0, firstError403Type = null) {
     // 如果没有提供 account，则获取一个
     if (!account) {
       account = await this.getAvailableAccount(user_id, model_name, user, excludeCookieIds);
@@ -728,15 +775,19 @@ class MultiAccountClient {
       requestBody.project = account.project_id_0;
     }
     
-    const url = config.api.url;
+    // 获取当前端点配置
+    const endpoint = getApiEndpoint(endpointIndex);
+    const url = endpoint.imageUrl;
     
     const requestHeaders = {
-      'Host': config.api.host,
+      'Host': endpoint.host,
       'User-Agent': config.api.userAgent,
       'Authorization': `Bearer ${account.access_token}`,
       'Content-Type': 'application/json',
       'Accept-Encoding': 'gzip'
     };
+    
+    logger.info(`[图片生成] 使用API端点[${endpointIndex}]: ${endpoint.host}`);
 
     
     let response;
@@ -763,16 +814,33 @@ class MultiAccountClient {
         const responseText = await response.text();
         
         if (response.status === 403) {
-          // 检查是否是 "The caller does not have permission" 错误
-          // 这种错误通常是临时性的，不应该禁用账号，直接返回错误
-          if (responseText.includes('The caller does not have permission') || responseText.includes('PERMISSION_DENIED')) {
-            logger.warn(`[图片生成-403错误] 调用者没有权限(临时性错误)，不禁用账号，直接返回错误: cookie_id=${account.cookie_id}`);
-            throw new ApiError('PERMISSION_DENIED', 403, responseText);
-          }
+          // 判断是否是 "The caller does not have permission" 错误
+          const isPermissionDenied = responseText.includes('The caller does not have permission');
           
-          // 其他403错误，禁用账号
-          logger.warn(`账号没有使用权限(403)，已禁用: cookie_id=${account.cookie_id}`);
-          await accountService.updateAccountStatus(account.cookie_id, 0);
+          // 记录第一次403错误的类型（只在第一次请求时记录）
+          const currentFirstError403Type = firstError403Type === null
+            ? (isPermissionDenied ? 'PERMISSION_DENIED' : 'OTHER_403')
+            : firstError403Type;
+          
+          // 所有403错误都尝试切换端点重试
+          const nextEndpointIndex = endpointIndex + 1;
+          const totalEndpoints = getEndpointCount();
+          
+          if (nextEndpointIndex < totalEndpoints) {
+            // 还有其他端点可以尝试
+            logger.warn(`[图片生成-403错误] 端点[${endpointIndex}]返回403，尝试切换到端点[${nextEndpointIndex}]: cookie_id=${account.cookie_id}`);
+            return await this.generateImage(requestBody, user_id, model_name, user, account, excludeCookieIds, retryCount, nextEndpointIndex, currentFirstError403Type);
+          } else {
+            // 所有端点都返回403
+            // 只有当第一次错误不是 PERMISSION_DENIED 时才禁用账号
+            if (currentFirstError403Type !== 'PERMISSION_DENIED') {
+              logger.warn(`[图片生成-403错误] 所有${totalEndpoints}个端点都返回403，禁用账号: cookie_id=${account.cookie_id}`);
+              await accountService.updateAccountStatus(account.cookie_id, 0);
+            } else {
+              logger.warn(`[图片生成-403错误] 所有${totalEndpoints}个端点都返回403，但第一次错误是PERMISSION_DENIED，不禁用账号: cookie_id=${account.cookie_id}`);
+            }
+            throw new ApiError('ALL_ENDPOINTS_403', 403, responseText);
+          }
         }
         
         // 检查是否是400错误
@@ -891,29 +959,15 @@ class MultiAccountClient {
       throw error;
     }
 
-    // 解析响应 (处理 SSE 流式格式)
-    const responseText = await response.text();
-    const lines = responseText.split('\n');
-    let collectedParts = [];
-    let lastFinishReason = null;
-
-    for (const line of lines) {
-      if (line.startsWith('data: ')) {
-        const jsonStr = line.slice(6);
-        try {
-          const chunk = JSON.parse(jsonStr);
-          const parts = chunk.response?.candidates?.[0]?.content?.parts;
-          if (parts) {
-            collectedParts.push(...parts);
-          }
-          if (chunk.response?.candidates?.[0]?.finishReason) {
-            lastFinishReason = chunk.response.candidates[0].finishReason;
-          }
-        } catch (e) {
-          logger.warn(`图片生成响应解析失败: ${e.message}`);
-        }
-      }
-    }
+    // 解析响应 (非流式JSON格式)
+    const responseData = await response.json();
+    
+    // 上游响应格式是 { response: { candidates: [...] } }
+    // 需要从 response 字段中提取数据
+    const responseObj = responseData.response || responseData;
+    const candidates = responseObj.candidates || [];
+    const collectedParts = candidates[0]?.content?.parts || [];
+    const lastFinishReason = candidates[0]?.finishReason || 'STOP';
 
     // 构造标准的 Gemini 响应格式
     const data = {
@@ -923,7 +977,7 @@ class MultiAccountClient {
             parts: collectedParts,
             role: 'model'
           },
-          finishReason: lastFinishReason || 'STOP'
+          finishReason: lastFinishReason
         }
       ]
     };

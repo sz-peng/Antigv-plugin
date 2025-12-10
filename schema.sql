@@ -99,6 +99,13 @@ $$;
 
 ALTER FUNCTION public.update_user_shared_quota_max(p_user_id character varying, p_model_name character varying) OWNER TO antigravity;
 
+--
+-- Name: FUNCTION update_user_shared_quota_max(p_user_id character varying, p_model_name character varying); Type: COMMENT; Schema: public; Owner: antigravity
+--
+
+COMMENT ON FUNCTION public.update_user_shared_quota_max(p_user_id character varying, p_model_name character varying) IS '更新用户共享配额池的 max_quota（基于用户共享账号数量计算）。此函数主要用于 scripts/update-user-quotas.js 脚本同步配额。添加/删除账号时的 quota 更新由 JavaScript 代码处理。';
+
+
 SET default_tablespace = '';
 
 SET default_table_access_method = heap;
@@ -115,10 +122,14 @@ CREATE TABLE public.accounts (
     refresh_token text,
     expires_at bigint,
     status smallint DEFAULT 1 NOT NULL,
-    project_id_0 character varying(255) DEFAULT '',
-    is_restricted boolean DEFAULT false NOT NULL,
     created_at timestamp without time zone DEFAULT CURRENT_TIMESTAMP,
-    updated_at timestamp without time zone DEFAULT CURRENT_TIMESTAMP
+    updated_at timestamp without time zone DEFAULT CURRENT_TIMESTAMP,
+    need_refresh boolean DEFAULT false NOT NULL,
+    name character varying(100),
+    project_id_0 character varying(255) DEFAULT ''::character varying,
+    is_restricted boolean DEFAULT false NOT NULL,
+    paid_tier boolean,
+    ineligible boolean DEFAULT false NOT NULL
 );
 
 
@@ -181,6 +192,34 @@ COMMENT ON COLUMN public.accounts.status IS '账号状态: 0=禁用, 1=启用';
 
 
 --
+-- Name: COLUMN accounts.created_at; Type: COMMENT; Schema: public; Owner: antigravity
+--
+
+COMMENT ON COLUMN public.accounts.created_at IS '创建时间';
+
+
+--
+-- Name: COLUMN accounts.updated_at; Type: COMMENT; Schema: public; Owner: antigravity
+--
+
+COMMENT ON COLUMN public.accounts.updated_at IS '更新时间';
+
+
+--
+-- Name: COLUMN accounts.need_refresh; Type: COMMENT; Schema: public; Owner: antigravity
+--
+
+COMMENT ON COLUMN public.accounts.need_refresh IS '是否需要重新刷新token: true=需要用户重新授权, false=正常';
+
+
+--
+-- Name: COLUMN accounts.name; Type: COMMENT; Schema: public; Owner: antigravity
+--
+
+COMMENT ON COLUMN public.accounts.name IS '账号名称（用户自定义）';
+
+
+--
 -- Name: COLUMN accounts.project_id_0; Type: COMMENT; Schema: public; Owner: antigravity
 --
 
@@ -195,17 +234,351 @@ COMMENT ON COLUMN public.accounts.is_restricted IS '是否受地区限制: false
 
 
 --
--- Name: COLUMN accounts.created_at; Type: COMMENT; Schema: public; Owner: antigravity
+-- Name: COLUMN accounts.paid_tier; Type: COMMENT; Schema: public; Owner: antigravity
 --
 
-COMMENT ON COLUMN public.accounts.created_at IS '创建时间';
+COMMENT ON COLUMN public.accounts.paid_tier IS '是否付费用户: true=付费, false=免费（默认）';
 
 
 --
--- Name: COLUMN accounts.updated_at; Type: COMMENT; Schema: public; Owner: antigravity
+-- Name: COLUMN accounts.ineligible; Type: COMMENT; Schema: public; Owner: antigravity
 --
 
-COMMENT ON COLUMN public.accounts.updated_at IS '更新时间';
+COMMENT ON COLUMN public.accounts.ineligible IS '账号是否不合格: false=合格, true=不合格(INELIGIBLE_ACCOUNT)';
+
+
+--
+-- Name: kiro_accounts; Type: TABLE; Schema: public; Owner: antigravity
+--
+
+CREATE TABLE public.kiro_accounts (
+    account_id uuid DEFAULT public.uuid_generate_v4() NOT NULL,
+    user_id uuid NOT NULL,
+    account_name character varying(100),
+    auth_method character varying(20) NOT NULL,
+    refresh_token text NOT NULL,
+    access_token text,
+    expires_at bigint,
+    client_id text,
+    client_secret text,
+    profile_arn text,
+    machineid text NOT NULL,
+    is_shared smallint DEFAULT 0 NOT NULL,
+    email character varying(255),
+    userid text NOT NULL,
+    subscription text NOT NULL,
+    current_usage double precision NOT NULL,
+    reset_date text NOT NULL,
+    free_trial_status boolean NOT NULL,
+    free_trial_usage double precision,
+    free_trial_expiry text,
+    free_trial_limit double precision NOT NULL,
+    usage_limit double precision NOT NULL,
+    status smallint DEFAULT 1 NOT NULL,
+    created_at timestamp without time zone DEFAULT CURRENT_TIMESTAMP,
+    updated_at timestamp without time zone DEFAULT CURRENT_TIMESTAMP,
+    need_refresh boolean DEFAULT false NOT NULL,
+    bonus_usage double precision DEFAULT 0,
+    bonus_limit double precision DEFAULT 0,
+    bonus_available double precision DEFAULT 0,
+    bonus_details jsonb DEFAULT '[]'::jsonb,
+    CONSTRAINT kiro_accounts_auth_method_check CHECK (((auth_method)::text = ANY ((ARRAY['Social'::character varying, 'IdC'::character varying, ''::character varying])::text[]))),
+    CONSTRAINT kiro_accounts_is_shared_check CHECK ((is_shared = ANY (ARRAY[0, 1]))),
+    CONSTRAINT kiro_accounts_status_check CHECK ((status = ANY (ARRAY[0, 1])))
+);
+
+
+ALTER TABLE public.kiro_accounts OWNER TO antigravity;
+
+--
+-- Name: TABLE kiro_accounts; Type: COMMENT; Schema: public; Owner: antigravity
+--
+
+COMMENT ON TABLE public.kiro_accounts IS 'Kiro账号表（独立系统）';
+
+
+--
+-- Name: COLUMN kiro_accounts.account_id; Type: COMMENT; Schema: public; Owner: antigravity
+--
+
+COMMENT ON COLUMN public.kiro_accounts.account_id IS '账号UUID（主键）';
+
+
+--
+-- Name: COLUMN kiro_accounts.user_id; Type: COMMENT; Schema: public; Owner: antigravity
+--
+
+COMMENT ON COLUMN public.kiro_accounts.user_id IS '用户UUID（外键关联users表）';
+
+
+--
+-- Name: COLUMN kiro_accounts.account_name; Type: COMMENT; Schema: public; Owner: antigravity
+--
+
+COMMENT ON COLUMN public.kiro_accounts.account_name IS '账号名称（用户自定义）';
+
+
+--
+-- Name: COLUMN kiro_accounts.auth_method; Type: COMMENT; Schema: public; Owner: antigravity
+--
+
+COMMENT ON COLUMN public.kiro_accounts.auth_method IS '认证方式: Social, IdC';
+
+
+--
+-- Name: COLUMN kiro_accounts.refresh_token; Type: COMMENT; Schema: public; Owner: antigravity
+--
+
+COMMENT ON COLUMN public.kiro_accounts.refresh_token IS '刷新令牌';
+
+
+--
+-- Name: COLUMN kiro_accounts.access_token; Type: COMMENT; Schema: public; Owner: antigravity
+--
+
+COMMENT ON COLUMN public.kiro_accounts.access_token IS '访问令牌';
+
+
+--
+-- Name: COLUMN kiro_accounts.expires_at; Type: COMMENT; Schema: public; Owner: antigravity
+--
+
+COMMENT ON COLUMN public.kiro_accounts.expires_at IS '令牌过期时间（时间戳，毫秒）';
+
+
+--
+-- Name: COLUMN kiro_accounts.client_id; Type: COMMENT; Schema: public; Owner: antigravity
+--
+
+COMMENT ON COLUMN public.kiro_accounts.client_id IS 'IdC认证的client_id';
+
+
+--
+-- Name: COLUMN kiro_accounts.client_secret; Type: COMMENT; Schema: public; Owner: antigravity
+--
+
+COMMENT ON COLUMN public.kiro_accounts.client_secret IS 'IdC认证的client_secret';
+
+
+--
+-- Name: COLUMN kiro_accounts.profile_arn; Type: COMMENT; Schema: public; Owner: antigravity
+--
+
+COMMENT ON COLUMN public.kiro_accounts.profile_arn IS 'Social认证的profile_arn';
+
+
+--
+-- Name: COLUMN kiro_accounts.machineid; Type: COMMENT; Schema: public; Owner: antigravity
+--
+
+COMMENT ON COLUMN public.kiro_accounts.machineid IS '机器ID（必填）';
+
+
+--
+-- Name: COLUMN kiro_accounts.is_shared; Type: COMMENT; Schema: public; Owner: antigravity
+--
+
+COMMENT ON COLUMN public.kiro_accounts.is_shared IS 'Cookie共享标识: 0=专属, 1=共享（必填）';
+
+
+--
+-- Name: COLUMN kiro_accounts.email; Type: COMMENT; Schema: public; Owner: antigravity
+--
+
+COMMENT ON COLUMN public.kiro_accounts.email IS '账号邮箱（可选）';
+
+
+--
+-- Name: COLUMN kiro_accounts.userid; Type: COMMENT; Schema: public; Owner: antigravity
+--
+
+COMMENT ON COLUMN public.kiro_accounts.userid IS '用户ID标识（必填）';
+
+
+--
+-- Name: COLUMN kiro_accounts.subscription; Type: COMMENT; Schema: public; Owner: antigravity
+--
+
+COMMENT ON COLUMN public.kiro_accounts.subscription IS '当前订阅（必填）';
+
+
+--
+-- Name: COLUMN kiro_accounts.current_usage; Type: COMMENT; Schema: public; Owner: antigravity
+--
+
+COMMENT ON COLUMN public.kiro_accounts.current_usage IS '当前使用量（必填）';
+
+
+--
+-- Name: COLUMN kiro_accounts.reset_date; Type: COMMENT; Schema: public; Owner: antigravity
+--
+
+COMMENT ON COLUMN public.kiro_accounts.reset_date IS '重置日期（必填）';
+
+
+--
+-- Name: COLUMN kiro_accounts.free_trial_status; Type: COMMENT; Schema: public; Owner: antigravity
+--
+
+COMMENT ON COLUMN public.kiro_accounts.free_trial_status IS '免费试用状态（必填）';
+
+
+--
+-- Name: COLUMN kiro_accounts.free_trial_usage; Type: COMMENT; Schema: public; Owner: antigravity
+--
+
+COMMENT ON COLUMN public.kiro_accounts.free_trial_usage IS '免费试用使用量（可选）';
+
+
+--
+-- Name: COLUMN kiro_accounts.free_trial_expiry; Type: COMMENT; Schema: public; Owner: antigravity
+--
+
+COMMENT ON COLUMN public.kiro_accounts.free_trial_expiry IS '免费试用过期时间（可选）';
+
+
+--
+-- Name: COLUMN kiro_accounts.free_trial_limit; Type: COMMENT; Schema: public; Owner: antigravity
+--
+
+COMMENT ON COLUMN public.kiro_accounts.free_trial_limit IS '免费试用限额（必填）';
+
+
+--
+-- Name: COLUMN kiro_accounts.usage_limit; Type: COMMENT; Schema: public; Owner: antigravity
+--
+
+COMMENT ON COLUMN public.kiro_accounts.usage_limit IS '使用限额（必填）';
+
+
+--
+-- Name: COLUMN kiro_accounts.status; Type: COMMENT; Schema: public; Owner: antigravity
+--
+
+COMMENT ON COLUMN public.kiro_accounts.status IS '账号状态: 0=禁用, 1=启用';
+
+
+--
+-- Name: COLUMN kiro_accounts.created_at; Type: COMMENT; Schema: public; Owner: antigravity
+--
+
+COMMENT ON COLUMN public.kiro_accounts.created_at IS '创建时间';
+
+
+--
+-- Name: COLUMN kiro_accounts.updated_at; Type: COMMENT; Schema: public; Owner: antigravity
+--
+
+COMMENT ON COLUMN public.kiro_accounts.updated_at IS '更新时间';
+
+
+--
+-- Name: COLUMN kiro_accounts.need_refresh; Type: COMMENT; Schema: public; Owner: antigravity
+--
+
+COMMENT ON COLUMN public.kiro_accounts.need_refresh IS '是否需要重新刷新token: true=需要用户重新授权, false=正常';
+
+
+--
+-- Name: COLUMN kiro_accounts.bonus_usage; Type: COMMENT; Schema: public; Owner: antigravity
+--
+
+COMMENT ON COLUMN public.kiro_accounts.bonus_usage IS 'Bonus总使用量（包含免费试用和bonus）';
+
+
+--
+-- Name: COLUMN kiro_accounts.bonus_limit; Type: COMMENT; Schema: public; Owner: antigravity
+--
+
+COMMENT ON COLUMN public.kiro_accounts.bonus_limit IS 'Bonus总限额（包含免费试用和bonus）';
+
+
+--
+-- Name: COLUMN kiro_accounts.bonus_available; Type: COMMENT; Schema: public; Owner: antigravity
+--
+
+COMMENT ON COLUMN public.kiro_accounts.bonus_available IS 'Bonus可用额度（包含免费试用和bonus）';
+
+
+--
+-- Name: COLUMN kiro_accounts.bonus_details; Type: COMMENT; Schema: public; Owner: antigravity
+--
+
+COMMENT ON COLUMN public.kiro_accounts.bonus_details IS 'Bonus详情（JSON数组，包含每个bonus的详细信息）';
+
+
+--
+-- Name: kiro_consumption_log; Type: TABLE; Schema: public; Owner: antigravity
+--
+
+CREATE TABLE public.kiro_consumption_log (
+    log_id uuid DEFAULT public.uuid_generate_v4() NOT NULL,
+    user_id uuid NOT NULL,
+    account_id uuid NOT NULL,
+    model_id character varying(100) NOT NULL,
+    credit_used numeric(10,4) NOT NULL,
+    is_shared smallint DEFAULT 0 NOT NULL,
+    consumed_at timestamp without time zone DEFAULT CURRENT_TIMESTAMP,
+    CONSTRAINT kiro_consumption_log_is_shared_check CHECK ((is_shared = ANY (ARRAY[0, 1])))
+);
+
+
+ALTER TABLE public.kiro_consumption_log OWNER TO antigravity;
+
+--
+-- Name: TABLE kiro_consumption_log; Type: COMMENT; Schema: public; Owner: antigravity
+--
+
+COMMENT ON TABLE public.kiro_consumption_log IS 'Kiro消费日志表：记录每次对话的credit消耗';
+
+
+--
+-- Name: COLUMN kiro_consumption_log.log_id; Type: COMMENT; Schema: public; Owner: antigravity
+--
+
+COMMENT ON COLUMN public.kiro_consumption_log.log_id IS '日志ID（主键）';
+
+
+--
+-- Name: COLUMN kiro_consumption_log.user_id; Type: COMMENT; Schema: public; Owner: antigravity
+--
+
+COMMENT ON COLUMN public.kiro_consumption_log.user_id IS '用户ID';
+
+
+--
+-- Name: COLUMN kiro_consumption_log.account_id; Type: COMMENT; Schema: public; Owner: antigravity
+--
+
+COMMENT ON COLUMN public.kiro_consumption_log.account_id IS 'Kiro账号ID';
+
+
+--
+-- Name: COLUMN kiro_consumption_log.model_id; Type: COMMENT; Schema: public; Owner: antigravity
+--
+
+COMMENT ON COLUMN public.kiro_consumption_log.model_id IS '模型ID';
+
+
+--
+-- Name: COLUMN kiro_consumption_log.credit_used; Type: COMMENT; Schema: public; Owner: antigravity
+--
+
+COMMENT ON COLUMN public.kiro_consumption_log.credit_used IS '消耗的credit（保留4位小数）';
+
+
+--
+-- Name: COLUMN kiro_consumption_log.is_shared; Type: COMMENT; Schema: public; Owner: antigravity
+--
+
+COMMENT ON COLUMN public.kiro_consumption_log.is_shared IS '是否使用共享账号（1=共享，0=专属）';
+
+
+--
+-- Name: COLUMN kiro_consumption_log.consumed_at; Type: COMMENT; Schema: public; Owner: antigravity
+--
+
+COMMENT ON COLUMN public.kiro_consumption_log.consumed_at IS '消耗时间';
 
 
 --
@@ -562,6 +935,22 @@ ALTER TABLE ONLY public.accounts
 
 
 --
+-- Name: kiro_accounts kiro_accounts_pkey; Type: CONSTRAINT; Schema: public; Owner: antigravity
+--
+
+ALTER TABLE ONLY public.kiro_accounts
+    ADD CONSTRAINT kiro_accounts_pkey PRIMARY KEY (account_id);
+
+
+--
+-- Name: kiro_consumption_log kiro_consumption_log_pkey; Type: CONSTRAINT; Schema: public; Owner: antigravity
+--
+
+ALTER TABLE ONLY public.kiro_consumption_log
+    ADD CONSTRAINT kiro_consumption_log_pkey PRIMARY KEY (log_id);
+
+
+--
 -- Name: model_quotas model_quotas_pkey; Type: CONSTRAINT; Schema: public; Owner: antigravity
 --
 
@@ -618,10 +1007,31 @@ ALTER TABLE ONLY public.users
 
 
 --
+-- Name: idx_accounts_ineligible; Type: INDEX; Schema: public; Owner: antigravity
+--
+
+CREATE INDEX idx_accounts_ineligible ON public.accounts USING btree (ineligible);
+
+
+--
 -- Name: idx_accounts_is_shared; Type: INDEX; Schema: public; Owner: antigravity
 --
 
 CREATE INDEX idx_accounts_is_shared ON public.accounts USING btree (is_shared);
+
+
+--
+-- Name: idx_accounts_need_refresh; Type: INDEX; Schema: public; Owner: antigravity
+--
+
+CREATE INDEX idx_accounts_need_refresh ON public.accounts USING btree (need_refresh);
+
+
+--
+-- Name: idx_accounts_paid_tier; Type: INDEX; Schema: public; Owner: antigravity
+--
+
+CREATE INDEX idx_accounts_paid_tier ON public.accounts USING btree (paid_tier);
 
 
 --
@@ -636,6 +1046,104 @@ CREATE INDEX idx_accounts_status ON public.accounts USING btree (status);
 --
 
 CREATE INDEX idx_accounts_user_id ON public.accounts USING btree (user_id);
+
+
+--
+-- Name: idx_kiro_accounts_auth_method; Type: INDEX; Schema: public; Owner: antigravity
+--
+
+CREATE INDEX idx_kiro_accounts_auth_method ON public.kiro_accounts USING btree (auth_method);
+
+
+--
+-- Name: idx_kiro_accounts_bonus_available; Type: INDEX; Schema: public; Owner: antigravity
+--
+
+CREATE INDEX idx_kiro_accounts_bonus_available ON public.kiro_accounts USING btree (bonus_available);
+
+
+--
+-- Name: idx_kiro_accounts_email; Type: INDEX; Schema: public; Owner: antigravity
+--
+
+CREATE INDEX idx_kiro_accounts_email ON public.kiro_accounts USING btree (email);
+
+
+--
+-- Name: idx_kiro_accounts_is_shared; Type: INDEX; Schema: public; Owner: antigravity
+--
+
+CREATE INDEX idx_kiro_accounts_is_shared ON public.kiro_accounts USING btree (is_shared);
+
+
+--
+-- Name: idx_kiro_accounts_need_refresh; Type: INDEX; Schema: public; Owner: antigravity
+--
+
+CREATE INDEX idx_kiro_accounts_need_refresh ON public.kiro_accounts USING btree (need_refresh);
+
+
+--
+-- Name: idx_kiro_accounts_status; Type: INDEX; Schema: public; Owner: antigravity
+--
+
+CREATE INDEX idx_kiro_accounts_status ON public.kiro_accounts USING btree (status);
+
+
+--
+-- Name: idx_kiro_accounts_subscription; Type: INDEX; Schema: public; Owner: antigravity
+--
+
+CREATE INDEX idx_kiro_accounts_subscription ON public.kiro_accounts USING btree (subscription);
+
+
+--
+-- Name: idx_kiro_accounts_user_id; Type: INDEX; Schema: public; Owner: antigravity
+--
+
+CREATE INDEX idx_kiro_accounts_user_id ON public.kiro_accounts USING btree (user_id);
+
+
+--
+-- Name: idx_kiro_accounts_userid; Type: INDEX; Schema: public; Owner: antigravity
+--
+
+CREATE INDEX idx_kiro_accounts_userid ON public.kiro_accounts USING btree (userid);
+
+
+--
+-- Name: idx_kiro_consumption_account_id; Type: INDEX; Schema: public; Owner: antigravity
+--
+
+CREATE INDEX idx_kiro_consumption_account_id ON public.kiro_consumption_log USING btree (account_id);
+
+
+--
+-- Name: idx_kiro_consumption_consumed_at; Type: INDEX; Schema: public; Owner: antigravity
+--
+
+CREATE INDEX idx_kiro_consumption_consumed_at ON public.kiro_consumption_log USING btree (consumed_at);
+
+
+--
+-- Name: idx_kiro_consumption_is_shared; Type: INDEX; Schema: public; Owner: antigravity
+--
+
+CREATE INDEX idx_kiro_consumption_is_shared ON public.kiro_consumption_log USING btree (is_shared);
+
+
+--
+-- Name: idx_kiro_consumption_model_id; Type: INDEX; Schema: public; Owner: antigravity
+--
+
+CREATE INDEX idx_kiro_consumption_model_id ON public.kiro_consumption_log USING btree (model_id);
+
+
+--
+-- Name: idx_kiro_consumption_user_id; Type: INDEX; Schema: public; Owner: antigravity
+--
+
+CREATE INDEX idx_kiro_consumption_user_id ON public.kiro_consumption_log USING btree (user_id);
 
 
 --
@@ -737,6 +1245,13 @@ CREATE TRIGGER update_accounts_updated_at BEFORE UPDATE ON public.accounts FOR E
 
 
 --
+-- Name: kiro_accounts update_kiro_accounts_updated_at; Type: TRIGGER; Schema: public; Owner: antigravity
+--
+
+CREATE TRIGGER update_kiro_accounts_updated_at BEFORE UPDATE ON public.kiro_accounts FOR EACH ROW EXECUTE FUNCTION public.update_updated_at_column();
+
+
+--
 -- Name: users update_users_updated_at; Type: TRIGGER; Schema: public; Owner: antigravity
 --
 
@@ -784,6 +1299,31 @@ ALTER TABLE ONLY public.user_shared_quota_pool
 
 
 --
+-- Name: kiro_accounts kiro_accounts_user_id_fkey; Type: FK CONSTRAINT; Schema: public; Owner: antigravity
+--
+
+ALTER TABLE ONLY public.kiro_accounts
+    ADD CONSTRAINT kiro_accounts_user_id_fkey FOREIGN KEY (user_id) REFERENCES public.users(user_id) ON DELETE CASCADE;
+
+
+--
+-- Name: kiro_consumption_log kiro_consumption_log_account_id_fkey; Type: FK CONSTRAINT; Schema: public; Owner: antigravity
+--
+
+ALTER TABLE ONLY public.kiro_consumption_log
+    ADD CONSTRAINT kiro_consumption_log_account_id_fkey FOREIGN KEY (account_id) REFERENCES public.kiro_accounts(account_id) ON DELETE CASCADE;
+
+
+--
+-- Name: kiro_consumption_log kiro_consumption_log_user_id_fkey; Type: FK CONSTRAINT; Schema: public; Owner: antigravity
+--
+
+ALTER TABLE ONLY public.kiro_consumption_log
+    ADD CONSTRAINT kiro_consumption_log_user_id_fkey FOREIGN KEY (user_id) REFERENCES public.users(user_id) ON DELETE CASCADE;
+
+
+--
 -- PostgreSQL database dump complete
 --
+
 

@@ -1,5 +1,4 @@
 import logger from '../utils/logger.js';
-import { generateProjectId } from '../utils/utils.js';
 import accountService from './account.service.js';
 import config from '../config/config.js';
 

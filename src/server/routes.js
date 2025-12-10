@@ -1507,8 +1507,7 @@ router.post('/v1/chat/completions', authenticateApiKey, async (req, res) => {
  * POST /v1beta/models/{model}:streamGenerateContent
  * Body: { contents, generationConfig }
  *
- * 使用 SSE 心跳保活机制避免 Cloudflare 100秒超时
- * 每30秒发送一个心跳注释，最后发送完整的 JSON 结果
+ * 直接返回 JSON 响应（非流式）
  *
  * 注意：streamGenerateContent 和 generateContent 使用相同的处理逻辑
  */
@@ -1516,39 +1515,6 @@ const handleGeminiImageGeneration = async (req, res) => {
   // 设置10分钟超时（图片生成可能需要较长时间）
   req.setTimeout(600000); // 10分钟 = 600000毫秒
   res.setTimeout(600000);
-  
-  // 设置 SSE 响应头，用于心跳保活
-  res.setHeader('Content-Type', 'text/event-stream');
-  res.setHeader('Cache-Control', 'no-cache');
-  res.setHeader('Connection', 'keep-alive');
-  res.setHeader('X-Accel-Buffering', 'no'); // 禁用 nginx 缓冲
-
-  let responseEnded = false;
-
-  // 心跳定时器，每30秒发送一个注释保持连接
-  const heartbeatInterval = setInterval(() => {
-    if (responseEnded) {
-      return;
-    }
-    try {
-      res.write(': heartbeat\n\n');
-    } catch (e) {
-      // 忽略写入错误（连接可能已关闭）
-      responseEnded = true;
-    }
-  }, 30000);
-
-  // 清理函数
-  const cleanup = () => {
-    clearInterval(heartbeatInterval);
-    responseEnded = true;
-  };
-
-  // 监听连接关闭
-  req.on('close', cleanup);
-  res.on('close', () => {
-    responseEnded = true;
-  });
   
   let requestBody = null;
   
@@ -1558,22 +1524,13 @@ const handleGeminiImageGeneration = async (req, res) => {
 
     // 验证必需参数
     if (!contents || !Array.isArray(contents) || contents.length === 0) {
-      cleanup();
-      if (!responseEnded) {
-        try {
-          res.write(`data: ${JSON.stringify({
-            error: {
-              code: 400,
-              message: 'contents是必需的且必须是非空数组',
-              status: 'INVALID_ARGUMENT'
-            }
-          })}\n\n`);
-          res.end();
-        } catch (writeError) {
-          logger.warn(`图片生成写入验证错误失败: ${writeError.message}`);
+      return res.status(400).json({
+        error: {
+          code: 400,
+          message: 'contents是必需的且必须是非空数组',
+          status: 'INVALID_ARGUMENT'
         }
-      }
-      return;
+      });
     }
 
     // 提取提示词和图片（从用户消息中）
@@ -1600,22 +1557,13 @@ const handleGeminiImageGeneration = async (req, res) => {
 
     // 至少需要文本提示词或图片
     if (!prompt && images.length === 0) {
-      cleanup();
-      if (!responseEnded) {
-        try {
-          res.write(`data: ${JSON.stringify({
-            error: {
-              code: 400,
-              message: '未找到有效的文本提示词或图片',
-              status: 'INVALID_ARGUMENT'
-            }
-          })}\n\n`);
-          res.end();
-        } catch (writeError) {
-          logger.warn(`图片生成写入验证错误失败: ${writeError.message}`);
+      return res.status(400).json({
+        error: {
+          code: 400,
+          message: '未找到有效的文本提示词或图片',
+          status: 'INVALID_ARGUMENT'
         }
-      }
-      return;
+      });
     }
 
     // 提取 imageConfig 参数
@@ -1645,22 +1593,9 @@ const handleGeminiImageGeneration = async (req, res) => {
       account
     );
 
-    // 清理心跳定时器
-    cleanup();
-
-    // 返回 Gemini 格式的响应（通过 SSE data 事件）
-    if (!responseEnded) {
-      try {
-        res.write(`data: ${JSON.stringify(data)}\n\n`);
-        res.end();
-      } catch (writeError) {
-        logger.warn(`图片生成写入响应失败: ${writeError.message}`);
-      }
-    }
+    // 直接返回 JSON 响应
+    res.json(data);
   } catch (error) {
-    // 清理心跳定时器
-    cleanup();
-
     logger.error('图片生成失败:', error.message);
     
     // 尝试转储错误现场（跳过常见错误）
@@ -1672,21 +1607,14 @@ const handleGeminiImageGeneration = async (req, res) => {
       await dumpErrorArtifacts(req.body, requestBody, error.responseText, error.message);
     }
 
-    if (!responseEnded) {
-      try {
-        const statusCode = error.statusCode || 500;
-        res.write(`data: ${JSON.stringify({
-          error: {
-            code: statusCode,
-            message: error.message,
-            status: 'INTERNAL'
-          }
-        })}\n\n`);
-        res.end();
-      } catch (writeError) {
-        logger.warn(`图片生成写入错误响应失败: ${writeError.message}`);
+    const statusCode = error.statusCode || 500;
+    res.status(statusCode).json({
+      error: {
+        code: statusCode,
+        message: error.message,
+        status: 'INTERNAL'
       }
-    }
+    });
   }
 };
 
