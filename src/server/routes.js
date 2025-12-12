@@ -478,6 +478,9 @@ router.get('/api/accounts/:cookie_id', authenticateApiKey, async (req, res) => {
  * 更新账号状态
  * PUT /api/accounts/:cookie_id/status
  * Body: { status }
+ *
+ * 禁用共享账号时：减少用户共享配额池的 quota 和 max_quota
+ * 启用共享账号时：增加用户共享配额池的 quota 和 max_quota
  */
 router.put('/api/accounts/:cookie_id/status', authenticateApiKey, async (req, res) => {
   try {
@@ -495,6 +498,57 @@ router.put('/api/accounts/:cookie_id/status', authenticateApiKey, async (req, re
     }
     if (!req.isAdmin && existingAccount.user_id !== req.user.user_id) {
       return res.status(403).json({ error: '无权修改此账号' });
+    }
+
+    // 如果状态没有变化，直接返回
+    if (existingAccount.status === status) {
+      return res.json({
+        success: true,
+        message: '账号状态未变化',
+        data: {
+          cookie_id: existingAccount.cookie_id,
+          status: existingAccount.status
+        }
+      });
+    }
+
+    // 如果是共享账号，需要处理配额变化
+    if (existingAccount.is_shared === 1) {
+      const accountQuotas = await quotaService.getQuotasByCookieId(cookie_id);
+      
+      if (status === 0) {
+        // 禁用共享账号：减少用户共享配额池的 quota 和 max_quota
+        logger.info(`禁用共享账号，正在减少用户共享配额: cookie_id=${cookie_id}, user_id=${existingAccount.user_id}`);
+        
+        for (const quota of accountQuotas) {
+          try {
+            await quotaService.removeUserSharedQuota(
+              existingAccount.user_id,
+              quota.model_name,
+              quota.quota
+            );
+            logger.info(`已减少共享配额: user_id=${existingAccount.user_id}, model=${quota.model_name}, quota=${quota.quota}`);
+          } catch (quotaError) {
+            logger.error(`减少共享配额失败: model=${quota.model_name}, error=${quotaError.message}`);
+          }
+        }
+      } else {
+        // 启用共享账号：增加用户共享配额池的 quota 和 max_quota
+        logger.info(`启用共享账号，正在增加用户共享配额: cookie_id=${cookie_id}, user_id=${existingAccount.user_id}`);
+        
+        for (const quota of accountQuotas) {
+          try {
+            await quotaService.addUserSharedQuota(
+              existingAccount.user_id,
+              quota.model_name,
+              quota.quota
+            );
+            logger.info(`已增加共享配额: user_id=${existingAccount.user_id}, model=${quota.model_name}, quota=${quota.quota}`);
+          } catch (quotaError) {
+            logger.error(`增加共享配额失败: model=${quota.model_name}, error=${quotaError.message}`);
+          }
+        }
+      }
     }
 
     const account = await accountService.updateAccountStatus(cookie_id, status);

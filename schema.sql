@@ -126,6 +126,7 @@ CREATE TABLE public.accounts (
     updated_at timestamp without time zone DEFAULT CURRENT_TIMESTAMP,
     need_refresh boolean DEFAULT false NOT NULL,
     name character varying(100),
+    email character varying(255),
     project_id_0 character varying(255) DEFAULT ''::character varying,
     is_restricted boolean DEFAULT false NOT NULL,
     paid_tier boolean,
@@ -217,6 +218,13 @@ COMMENT ON COLUMN public.accounts.need_refresh IS '是否需要重新刷新token
 --
 
 COMMENT ON COLUMN public.accounts.name IS '账号名称（用户自定义）';
+
+
+--
+-- Name: COLUMN accounts.email; Type: COMMENT; Schema: public; Owner: antigravity
+--
+
+COMMENT ON COLUMN public.accounts.email IS '账号邮箱（Google账号邮箱，用于防止重复添加）';
 
 
 --
@@ -1046,6 +1054,13 @@ CREATE INDEX idx_accounts_status ON public.accounts USING btree (status);
 --
 
 CREATE INDEX idx_accounts_user_id ON public.accounts USING btree (user_id);
+
+
+--
+-- Name: idx_accounts_email; Type: INDEX; Schema: public; Owner: antigravity
+--
+
+CREATE UNIQUE INDEX idx_accounts_email ON public.accounts USING btree (email) WHERE (email IS NOT NULL);
 
 
 --

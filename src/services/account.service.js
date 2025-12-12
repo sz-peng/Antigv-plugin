@@ -25,18 +25,19 @@ class AccountService {
       is_restricted = false,
       ineligible = false,
       name = null,
+      email = null,
       paid_tier = false
     } = accountData;
 
     try {
       const result = await database.query(
-        `INSERT INTO accounts (cookie_id, user_id, is_shared, access_token, refresh_token, expires_at, status, project_id_0, is_restricted, ineligible, name, paid_tier)
-         VALUES ($1, $2, $3, $4, $5, $6, 1, $7, $8, $9, $10, $11)
+        `INSERT INTO accounts (cookie_id, user_id, is_shared, access_token, refresh_token, expires_at, status, project_id_0, is_restricted, ineligible, name, email, paid_tier)
+         VALUES ($1, $2, $3, $4, $5, $6, 1, $7, $8, $9, $10, $11, $12)
          RETURNING *`,
-        [cookie_id, user_id, is_shared, access_token, refresh_token, expires_at, project_id_0, is_restricted, ineligible, name, paid_tier]
+        [cookie_id, user_id, is_shared, access_token, refresh_token, expires_at, project_id_0, is_restricted, ineligible, name, email, paid_tier]
       );
 
-      logger.info(`账号创建成功: cookie_id=${cookie_id}, user_id=${user_id}, name=${name || '(未设置)'}, paid_tier=${paid_tier}`);
+      logger.info(`账号创建成功: cookie_id=${cookie_id}, user_id=${user_id}, email=${email || '(未设置)'}, paid_tier=${paid_tier}`);
       return result.rows[0];
     } catch (error) {
       logger.error('创建账号失败:', error.message);
@@ -58,6 +59,24 @@ class AccountService {
       return result.rows[0] || null;
     } catch (error) {
       logger.error('查询账号失败:', error.message);
+      throw error;
+    }
+  }
+
+  /**
+   * 根据邮箱获取账号
+   * @param {string} email - 邮箱地址
+   * @returns {Promise<Object|null>} 账号信息
+   */
+  async getAccountByEmail(email) {
+    try {
+      const result = await database.query(
+        'SELECT * FROM accounts WHERE email = $1',
+        [email]
+      );
+      return result.rows[0] || null;
+    } catch (error) {
+      logger.error('根据邮箱查询账号失败:', error.message);
       throw error;
     }
   }

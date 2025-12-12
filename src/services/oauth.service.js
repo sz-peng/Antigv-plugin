@@ -369,13 +369,26 @@ class OAuthService {
 
     // 获取用户信息（email）
     let accountName = null;
+    let accountEmail = null;
     try {
       const userInfo = await this.getUserInfo(tokenData.access_token);
       if (userInfo.email) {
+        accountEmail = userInfo.email;
         accountName = userInfo.email;
-        logger.info(`获取到账号email: ${accountName}`);
+        logger.info(`获取到账号email: ${accountEmail}`);
+        
+        // 检查邮箱是否已存在
+        const existingAccount = await accountService.getAccountByEmail(accountEmail);
+        if (existingAccount) {
+          this.stateMap.delete(state);
+          throw new Error(`此邮箱已被添加过: ${accountEmail}`);
+        }
       }
     } catch (error) {
+      // 如果是邮箱重复错误，直接抛出
+      if (error.message.includes('此邮箱已被添加过')) {
+        throw error;
+      }
       logger.warn(`获取用户信息失败，将使用默认名称: ${error.message}`);
     }
 
@@ -502,6 +515,7 @@ class OAuthService {
       is_restricted,
       ineligible,
       name: accountName,
+      email: accountEmail,
       paid_tier
     });
 
